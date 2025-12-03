@@ -1,0 +1,232 @@
+name: Add Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain_name:
+        description: 'Domain name for the new application (e.g., another-app.com)'
+        required: true
+        type: string
+      app_port:
+        description: 'Application port (must be unique, e.g., 9001, 9002)'
+        required: true
+        type: number
+      metrics_path:
+        description: 'Metrics endpoint path (default: /metrics)'
+        required: false
+        type: string
+        default: '/metrics'
+      droplet_ip:
+        description: 'IP address of the existing droplet'
+        required: true
+        type: string
+
+jobs:
+  add-application:
+    name: Add Application to Existing Droplet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Allow pushing metadata.json to repository
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Validate inputs
+        run: |
+          echo "Validating inputs..."
+          
+          # Validate domain name (supports subdomains like test2.example.com)
+          if [[ ! "${{ inputs.domain_name }}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+                echo "Error: Invalid domain name format"
+            echo "Domain must be a valid FQDN (e.g., example.com or test2.example.com)"
+            exit 1
+          fi
+          
+          # Validate port
+          if [ "${{ inputs.app_port }}" -lt 1024 ] || [ "${{ inputs.app_port }}" -gt 65535 ]; then
+            echo "Error: Port must be between 1024 and 65535"
+            exit 1
+          fi
+          
+          # Validate IP address format
+          if [[ ! "${{ inputs.droplet_ip }}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "Error: Invalid IP address format"
+            exit 1
+          fi
+          
+          echo "✓ All inputs are valid"
+      
+      - name: Check for port conflicts
+        id: port-check
+        run: |
+          echo "Checking for port conflicts..."
+          
+          METADATA_FILE=".github/deployments/metadata.json"
+          NEW_PORT="${{ inputs.app_port }}"
+          
+          # Check if metadata file exists
+          if [ ! -f "$METADATA_FILE" ]; then
+            echo "Error: Metadata file not found at $METADATA_FILE"
+            echo "Please ensure you have created a droplet first using the create-droplet workflow"
+            exit 1
+          fi
+          
+          # Extract existing ports from metadata
+          EXISTING_PORTS=$(jq -r '.applications[].port' "$METADATA_FILE")
+          
+          # Check if new port conflicts with existing ports
+          for PORT in $EXISTING_PORTS; do
+            if [ "$PORT" = "$NEW_PORT" ]; then
+              echo "Error: Port $NEW_PORT is already in use by another application"
+              echo ""
+              echo "Existing applications and their ports:"
+              jq -r '.applications[] | "  - \(.domain): port \(.port)"' "$METADATA_FILE"
+              echo ""
+              echo "Please choose a different port for your new application"
+              exit 1
+            fi
+          done
+          
+          echo "✓ Port $NEW_PORT is available"
+          echo "port_available=true" >> $GITHUB_OUTPUT
+      
+      - name: Setup SSH key for connection
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Add to known_hosts
+          ssh-keyscan -p 53222 -H ${{ inputs.droplet_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      
+      - name: Add admin_username input parameter
+        run: |
+          echo "Note: This workflow requires admin access to the server"
+          echo "Using default admin username: admin"
+          echo "If you used a different username during droplet creation, this will fail"
+      
+      - name: Copy setup script to droplet
+        run: |
+          echo "Copying setup-application.sh to droplet..."
+          
+          # Use 'admin' as default admin username (can be overridden via workflow_dispatch input if needed)
+          ADMIN_USER="admin"
+          
+          scp -P 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            scripts/setup-application.sh \
+            ${ADMIN_USER}@${{ inputs.droplet_ip }}:/tmp/setup-application.sh
+          
+          echo "✓ Script copied successfully"
+      
+      - name: Run application setup script
+        id: setup-app
+        run: |
+          echo "Running application setup for new domain..."
+          
+          ADMIN_USER="admin"
+          
+          # Make script executable and run it with sudo
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${ADMIN_USER}@${{ inputs.droplet_ip }} \
+            "chmod +x /tmp/setup-application.sh && \
+             sudo /tmp/setup-application.sh \
+               '${{ inputs.domain_name }}' \
+               '${{ inputs.app_port }}' \
+               '${{ inputs.metrics_path }}' \
+               '${{ secrets.SSH_PUBLIC_KEY }}' && \
+             rm /tmp/setup-application.sh"
+          
+          # Generate username for metadata
+          USERNAME=$(echo "${{ inputs.domain_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-32)
+          echo "username=$USERNAME" >> $GITHUB_OUTPUT
+          echo "✓ Application setup completed"
+      
+      - name: Update metadata with new application
+        run: |
+          echo "Updating deployment metadata..."
+          
+          METADATA_FILE=".github/deployments/metadata.json"
+          
+          # Read existing metadata
+          EXISTING_METADATA=$(cat "$METADATA_FILE")
+          
+          # Create new application entry
+          NEW_APP=$(cat << EOF
+          {
+            "domain": "${{ inputs.domain_name }}",
+            "username": "${{ steps.setup-app.outputs.username }}",
+            "port": ${{ inputs.app_port }},
+            "metrics_path": "${{ inputs.metrics_path }}",
+            "service_name": "app-${{ steps.setup-app.outputs.username }}"
+          }
+          EOF
+          )
+          
+          # Append new application to the applications array
+          UPDATED_METADATA=$(echo "$EXISTING_METADATA" | jq ".applications += [$NEW_APP]")
+          
+          # Write updated metadata back to file
+          echo "$UPDATED_METADATA" > "$METADATA_FILE"
+          
+          echo "✓ Metadata updated successfully"
+          
+          # Display updated applications list
+          echo ""
+          echo "Current applications on this droplet:"
+          jq -r '.applications[] | "  - \(.domain) (port \(.port))"' "$METADATA_FILE"
+      
+      - name: Commit metadata changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add .github/deployments/metadata.json
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add application ${{ inputs.domain_name }} to droplet"
+            git push
+            echo "✓ Metadata committed to repository"
+          fi
+      
+      - name: Deployment summary
+        run: |
+          echo "## 🎉 Application Added Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### New Application Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Domain**: ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Username**: ${{ steps.setup-app.outputs.username }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Port**: ${{ inputs.app_port }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Metrics Path**: ${{ inputs.metrics_path }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service Name**: app-${{ steps.setup-app.outputs.username }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### SSH Access" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Admin access (for server administration):**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p 53222 admin@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Application user access (can deploy and restart own service):**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p 53222 ${{ steps.setup-app.outputs.username }}@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Configure DNS records for ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "   - A record: ${{ inputs.domain_name }} → ${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "   - A record: www.${{ inputs.domain_name }} → ${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Wait for DNS propagation (5-10 minutes)" >> $GITHUB_STEP_SUMMARY
+          echo "3. ✅ Deploy your application using a release tag" >> $GITHUB_STEP_SUMMARY
+          echo "4. ✅ Access your application at: https://${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### All Applications on This Droplet" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          jq -r '.applications[] | "- \(.domain): port \(.port), service: \(.service_name)"' .github/deployments/metadata.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

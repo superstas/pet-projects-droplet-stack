@@ -1,0 +1,243 @@
+#cloud-config
+
+# Update package database and upgrade all packages
+package_update: true
+package_upgrade: true
+
+# Install required packages
+packages:
+  - nginx
+  - certbot
+  - python3-certbot-nginx
+  - ufw
+  - sqlite3
+  - litecli
+  - prometheus
+  - unattended-upgrades
+  - logrotate
+  - curl
+  - wget
+  - git
+  - dnsutils
+  - rsync
+  - htop
+  - tree
+
+# Write configuration files
+write_files:
+  - path: /etc/ssh/sshd_config.d/custom.conf
+    content: |
+      Port 53222
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+      PermitRootLogin no
+    permissions: '0644'
+
+  # Journald log retention configuration
+  - path: /etc/systemd/journald.conf.d/retention.conf
+    content: |
+      [Journal]
+      MaxRetentionSec=90d
+      SystemMaxUse=1G
+    permissions: '0644'
+
+  # Logrotate configuration
+  - path: /etc/logrotate.d/custom
+    content: |
+      /var/log/*.log {
+          daily
+          rotate 90
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0640 root adm
+          sharedscripts
+      }
+    permissions: '0644'
+
+  # Unattended upgrades configuration
+  - path: /etc/apt/apt.conf.d/50unattended-upgrades
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}";
+          "${distro_id}:${distro_codename}-security";
+          "${distro_id}ESMApps:${distro_codename}-apps-security";
+          "${distro_id}ESM:${distro_codename}-infra-security";
+      };
+      Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+      Unattended-Upgrade::MinimalSteps "true";
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      Unattended-Upgrade::Automatic-Reboot "false";
+      Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+    permissions: '0644'
+
+  # Enable unattended upgrades
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Download-Upgradeable-Packages "1";
+      APT::Periodic::AutocleanInterval "7";
+      APT::Periodic::Unattended-Upgrade "1";
+    permissions: '0644'
+
+  # Disable IPv6
+  - path: /etc/sysctl.d/99-disable-ipv6.conf
+    content: |
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+      net.ipv6.conf.lo.disable_ipv6 = 1
+    permissions: '0644'
+
+  # Network performance tuning
+  - path: /etc/sysctl.d/99-network-tuning.conf
+    content: |
+      # Increase connection tracking table size
+      net.netfilter.nf_conntrack_max = 262144
+      net.nf_conntrack_max = 262144
+      
+      # Increase conntrack buckets (should be nf_conntrack_max / 4)
+      net.netfilter.nf_conntrack_buckets = 65536
+      
+      # Reduce conntrack timeout for established connections
+      net.netfilter.nf_conntrack_tcp_timeout_established = 600
+      
+      # Increase local port range
+      net.ipv4.ip_local_port_range = 1024 65535
+      
+      # Enable TCP fast open
+      net.ipv4.tcp_fastopen = 3
+      
+      # Increase max number of open files
+      fs.file-max = 2097152
+      
+      # Increase socket buffer sizes
+      net.core.rmem_max = 16777216
+      net.core.wmem_max = 16777216
+      net.ipv4.tcp_rmem = 4096 87380 16777216
+      net.ipv4.tcp_wmem = 4096 65536 16777216
+      
+      # Increase max backlog
+      net.core.netdev_max_backlog = 5000
+      net.core.somaxconn = 1024
+    permissions: '0644'
+
+  # Fix TERM for modern terminals (Kitty, Alacritty, etc.)
+  - path: /etc/profile.d/fix-term.sh
+    content: |
+      # Fix TERM variable for modern terminals that may not be recognized
+      # This prevents "Error opening terminal" errors with htop, vim, etc.
+      case "$TERM" in
+        xterm-kitty|alacritty|wezterm)
+          export TERM=xterm-256color
+          ;;
+      esac
+    permissions: '0644'
+
+  # Nginx main configuration backup marker
+  - path: /etc/nginx/nginx.conf.original
+    content: |
+      # This file marks that nginx.conf will be modified by cloud-init
+    permissions: '0644'
+
+  # System-wide file descriptor limits
+  - path: /etc/security/limits.d/99-nginx.conf
+    content: |
+      # Increase file descriptor limits for nginx
+      nginx soft nofile 65535
+      nginx hard nofile 65535
+      
+      # Increase limits for all users
+      * soft nofile 65535
+      * hard nofile 65535
+    permissions: '0644'
+
+# Commands to run after package installation
+runcmd:
+  # Disable IPv6
+  - sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+  
+  # Apply network tuning
+  - sysctl -p /etc/sysctl.d/99-network-tuning.conf
+
+  # Create systemd drop-in directory for nginx
+  - mkdir -p /etc/systemd/system/nginx.service.d
+
+  # Create nginx systemd override for higher limits
+  - |
+    cat > /etc/systemd/system/nginx.service.d/limits.conf <<EOF
+    [Service]
+    LimitNOFILE=65535
+    LimitNPROC=65535
+    EOF
+
+  # Reload systemd to apply nginx limits
+  - systemctl daemon-reload
+
+  # Backup original nginx.conf
+  - cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+
+  # Update nginx.conf for better performance
+  - |
+    sed -i 's/worker_processes.*/worker_processes auto;/' /etc/nginx/nginx.conf
+    sed -i 's/worker_connections.*/worker_connections 4096;/' /etc/nginx/nginx.conf
+    
+  # Add worker_rlimit_nofile if not present
+  - |
+    if ! grep -q "worker_rlimit_nofile" /etc/nginx/nginx.conf; then
+      sed -i '/worker_processes/a worker_rlimit_nofile 65535;' /etc/nginx/nginx.conf
+    fi
+
+  # Add multi_accept and use epoll in events block
+  - |
+    if ! grep -q "multi_accept" /etc/nginx/nginx.conf; then
+      sed -i '/events {/a \    multi_accept on;\n    use epoll;' /etc/nginx/nginx.conf
+    fi
+
+  # Test nginx configuration
+  - nginx -t || (cp /etc/nginx/nginx.conf.backup /etc/nginx/nginx.conf && echo "Nginx config update failed, restored backup")
+
+  # Create and configure swap
+  - dd if=/dev/zero of=/swapfile bs=1M count=1024
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - sysctl vm.swappiness=10
+  - echo 'vm.swappiness=10' >> /etc/sysctl.conf
+
+  # Configure UFW firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw limit 53222/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # Restart SSH with new configuration
+  - systemctl restart sshd
+
+  # Restart journald to apply retention settings
+  - systemctl restart systemd-journald
+
+  # Create basic Prometheus configuration
+  - mkdir -p /etc/prometheus
+  - |
+    cat > /etc/prometheus/prometheus.yml <<EOF
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+    EOF
+  - systemctl enable prometheus
+  - systemctl start prometheus
+
+  # Remove exim4 mail server (not needed for pet projects)
+  - systemctl stop exim4 || true
+  - apt-get remove --purge -y exim4 exim4-base exim4-config exim4-daemon-light || true
+  - apt-get autoremove -y

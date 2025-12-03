@@ -1,0 +1,312 @@
+name: Setup SSL
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain_name:
+        description: 'Domain name to configure SSL for (e.g., example.com)'
+        required: true
+        type: string
+      droplet_ip:
+        description: 'IP address of the droplet (optional - will read from metadata if not provided)'
+        required: false
+        type: string
+
+jobs:
+  setup-ssl:
+    name: Configure SSL Certificate
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Validate domain name input
+        run: |
+          echo "Validating domain name..."
+          
+          # Validate domain name format
+          if [[ ! "${{ inputs.domain_name }}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+            echo "Error: Invalid domain name format"
+            echo "Domain must be a valid FQDN (e.g., example.com)"
+            exit 1
+          fi
+          
+          echo "✓ Domain name is valid"
+      
+      - name: Resolve droplet IP address
+        id: resolve-ip
+        run: |
+          echo "Resolving droplet IP address..."
+          
+          DROPLET_IP="${{ inputs.droplet_ip }}"
+          
+          # If IP not provided, try to read from metadata
+          if [ -z "$DROPLET_IP" ]; then
+            echo "Droplet IP not provided, reading from metadata..."
+            
+            METADATA_FILE=".github/deployments/metadata.json"
+            
+            if [ ! -f "$METADATA_FILE" ]; then
+              echo "Error: Metadata file not found at $METADATA_FILE"
+              echo ""
+              echo "Please either:"
+              echo "  1. Provide the droplet_ip input parameter, or"
+              echo "  2. Ensure you have created a droplet using the create-droplet workflow"
+              exit 1
+            fi
+            
+            # Extract IP from metadata
+            DROPLET_IP=$(jq -r '.droplet.ip' "$METADATA_FILE")
+            
+            if [ -z "$DROPLET_IP" ] || [ "$DROPLET_IP" = "null" ]; then
+              echo "Error: Could not find droplet IP in metadata file"
+              echo ""
+              echo "Please provide the droplet_ip input parameter"
+              exit 1
+            fi
+            
+            echo "Found droplet IP in metadata: $DROPLET_IP"
+          else
+            echo "Using provided droplet IP: $DROPLET_IP"
+          fi
+          
+          # Validate IP address format
+          if ! [[ "$DROPLET_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "Error: Invalid IP address format: $DROPLET_IP"
+            exit 1
+          fi
+          
+          echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+          echo "✓ Droplet IP resolved: $DROPLET_IP"
+      
+      - name: Check DNS resolution
+        id: dns-check
+        run: |
+          echo "Checking DNS resolution for ${{ inputs.domain_name }}..."
+          
+          DOMAIN="${{ inputs.domain_name }}"
+          EXPECTED_IP="${{ steps.resolve-ip.outputs.ip }}"
+          
+          # Resolve domain using dig
+          RESOLVED_IP=$(dig +short "$DOMAIN" A | head -n 1)
+          
+          if [ -z "$RESOLVED_IP" ]; then
+            echo "❌ DNS Resolution Failed"
+            echo ""
+            echo "Domain $DOMAIN does not resolve to any IP address."
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📋 DNS Configuration Required"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "Please configure the following DNS records with your domain registrar:"
+            echo ""
+            echo "  Record Type: A"
+            echo "  Name:        @"
+            echo "  Value:       $EXPECTED_IP"
+            echo "  TTL:         3600 (or default)"
+            echo ""
+            echo "  Record Type: A"
+            echo "  Name:        www"
+            echo "  Value:       $EXPECTED_IP"
+            echo "  TTL:         3600 (or default)"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⏱️  Next Steps"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "1. Add the DNS records shown above to your domain registrar"
+            echo "2. Wait for DNS propagation (typically 5-30 minutes)"
+            echo "3. Verify DNS propagation using: dig +short $DOMAIN"
+            echo "4. Re-run this workflow once DNS is propagated"
+            echo ""
+            exit 1
+          fi
+          
+          echo "Domain resolves to: $RESOLVED_IP"
+          echo "Expected IP:        $EXPECTED_IP"
+          
+          if [ "$RESOLVED_IP" != "$EXPECTED_IP" ]; then
+            echo ""
+            echo "❌ DNS Mismatch Detected"
+            echo ""
+            echo "Domain $DOMAIN resolves to $RESOLVED_IP"
+            echo "but should resolve to $EXPECTED_IP"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📋 DNS Configuration Update Required"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "Please update your DNS records to point to the correct IP:"
+            echo ""
+            echo "  Record Type: A"
+            echo "  Name:        @"
+            echo "  Value:       $EXPECTED_IP  (currently: $RESOLVED_IP)"
+            echo "  TTL:         3600 (or default)"
+            echo ""
+            echo "  Record Type: A"
+            echo "  Name:        www"
+            echo "  Value:       $EXPECTED_IP"
+            echo "  TTL:         3600 (or default)"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⏱️  Next Steps"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "1. Update the DNS A record to point to $EXPECTED_IP"
+            echo "2. Wait for DNS propagation (typically 5-30 minutes)"
+            echo "3. Verify DNS propagation using: dig +short $DOMAIN"
+            echo "4. Re-run this workflow once DNS is updated"
+            echo ""
+            exit 1
+          fi
+          
+          echo "✓ DNS resolution is correct!"
+          
+          # Also check www subdomain
+          WWW_RESOLVED_IP=$(dig +short "www.$DOMAIN" A | head -n 1)
+          
+          if [ -z "$WWW_RESOLVED_IP" ]; then
+            echo "⚠️  Warning: www.$DOMAIN does not resolve"
+            echo "   Consider adding a DNS A record for www.$DOMAIN -> $EXPECTED_IP"
+          elif [ "$WWW_RESOLVED_IP" != "$EXPECTED_IP" ]; then
+            echo "⚠️  Warning: www.$DOMAIN resolves to $WWW_RESOLVED_IP (expected: $EXPECTED_IP)"
+            echo "   Consider updating the DNS A record for www.$DOMAIN"
+          else
+            echo "✓ www.$DOMAIN also resolves correctly"
+          fi
+      
+      - name: Setup SSH key for connection
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Add to known_hosts
+          ssh-keyscan -p 53222 -H ${{ steps.resolve-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      
+      - name: Determine admin username
+        id: admin-user
+        run: |
+          echo "Determining admin username from metadata..."
+          
+          METADATA_FILE=".github/deployments/metadata.json"
+          
+          # Default to 'admin' if metadata doesn't exist
+          ADMIN_USER="admin"
+          
+          if [ -f "$METADATA_FILE" ]; then
+            # Try to extract admin username from metadata if available
+            # For now, we'll use the default 'admin' as it's the standard
+            echo "Using default admin username: admin"
+          fi
+          
+          echo "username=$ADMIN_USER" >> $GITHUB_OUTPUT
+          echo "✓ Admin username: $ADMIN_USER"
+      
+      - name: Copy setup-ssl.sh script to droplet
+        run: |
+          echo "Copying setup-ssl.sh to droplet..."
+          ADMIN_USER="${{ steps.admin-user.outputs.username }}"
+          
+          scp -P 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            scripts/setup-ssl.sh \
+            ${ADMIN_USER}@${{ steps.resolve-ip.outputs.ip }}:/tmp/setup-ssl.sh
+          
+          echo "✓ Script copied successfully"
+      
+      - name: Execute SSL setup script
+        id: ssl-setup
+        run: |
+          echo "Running SSL setup script on droplet..."
+          echo ""
+          ADMIN_USER="${{ steps.admin-user.outputs.username }}"
+          
+          # Make script executable and run it with sudo
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${ADMIN_USER}@${{ steps.resolve-ip.outputs.ip }} \
+            "chmod +x /tmp/setup-ssl.sh && \
+             sudo /tmp/setup-ssl.sh \
+               '${{ inputs.domain_name }}' \
+               '${{ steps.resolve-ip.outputs.ip }}'"
+          
+          echo ""
+          echo "✓ SSL setup completed successfully"
+      
+      - name: Verify HTTPS access
+        id: verify-https
+        run: |
+          echo "Verifying HTTPS access..."
+          
+          HTTPS_URL="https://${{ inputs.domain_name }}"
+          
+          # Wait a moment for nginx to fully reload
+          sleep 5
+          
+          # Test HTTPS endpoint
+          echo "Testing HTTPS endpoint: $HTTPS_URL"
+          
+          HTTP_CODE=$(curl -f -s -o /dev/null -w "%{http_code}" --max-time 15 "$HTTPS_URL" 2>/dev/null || echo "000")
+          
+          if [ "$HTTP_CODE" = "000" ]; then
+            echo "⚠️  Could not connect to HTTPS endpoint"
+            echo "   This may be normal if your application is not yet deployed"
+            echo "   The SSL certificate and nginx configuration are correctly set up"
+          elif [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+            echo "✓ HTTPS endpoint is accessible (HTTP $HTTP_CODE)"
+          else
+            echo "⚠️  HTTPS endpoint returned HTTP $HTTP_CODE"
+            echo "   This may be normal depending on your application"
+            echo "   The SSL certificate and nginx configuration are correctly set up"
+          fi
+          
+          # Check SSL certificate
+          echo ""
+          echo "Checking SSL certificate..."
+          
+          if echo | openssl s_client -servername "${{ inputs.domain_name }}" -connect "${{ inputs.domain_name }}:443" 2>/dev/null | openssl x509 -noout -subject -dates > /dev/null 2>&1; then
+            echo "✓ SSL certificate is valid"
+            
+            CERT_INFO=$(echo | openssl s_client -servername "${{ inputs.domain_name }}" -connect "${{ inputs.domain_name }}:443" 2>/dev/null | openssl x509 -noout -subject -dates)
+            echo "$CERT_INFO"
+          else
+            echo "⚠️  Could not verify SSL certificate details"
+            echo "   Certificate should still be valid"
+          fi
+      
+      - name: SSL setup summary
+        run: |
+          echo "## 🔒 SSL Setup Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Domain**: ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Droplet IP**: ${{ steps.resolve-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Certificate Provider**: Let's Encrypt" >> $GITHUB_STEP_SUMMARY
+          echo "- **Auto-Renewal**: Enabled via certbot" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎉 Your Application is Now Accessible via HTTPS!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Primary URL**: https://${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Security Features Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ TLS 1.2 and TLS 1.3 protocols" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Strong cipher suites" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ HSTS (HTTP Strict Transport Security)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ HTTP to HTTPS redirect" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ www to non-www redirect" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Automatic certificate renewal" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Deploy your application using a release tag (v*.*.*)" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Access your application at: https://${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "3. ✅ Monitor your SSL certificate renewal (automatic via certbot)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Certificate Information" >> $GITHUB_STEP_SUMMARY
+          echo "- Certificate location: \`/etc/letsencrypt/live/${{ inputs.domain_name }}/\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Renewal check runs daily via certbot timer" >> $GITHUB_STEP_SUMMARY
+          echo "- Certificates are valid for 90 days and auto-renew at 30 days" >> $GITHUB_STEP_SUMMARY

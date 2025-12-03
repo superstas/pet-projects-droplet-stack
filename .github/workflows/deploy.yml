@@ -1,0 +1,298 @@
+name: Deploy Application
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      domain_name:
+        description: 'Domain name (optional, uses first app from metadata if empty)'
+        required: false
+        type: string
+      app_directory:
+        description: 'Path to application directory in repository'
+        required: false
+        type: string
+        default: './app'
+
+jobs:
+  deploy:
+    name: Deploy Application to Droplet
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}  # Ensure we get the latest commit with metadata
+      
+      - name: Extract tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Extract tag from push event
+            TAG=${GITHUB_REF#refs/tags/}
+          else
+            # For manual workflow dispatch, use latest tag
+            TAG=$(git describe --tags --abbrev=0)
+          fi
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Deploying version: $TAG"
+      
+      - name: Load deployment metadata
+        id: metadata
+        run: |
+          # Pull latest changes to ensure we have metadata.json
+          git pull origin ${{ github.ref_name }} || true
+          
+          METADATA_FILE=".github/deployments/metadata.json"
+          
+          if [ ! -f "$METADATA_FILE" ]; then
+            echo "Error: Metadata file not found at $METADATA_FILE"
+            echo "Please ensure you have created a droplet first using the create-droplet workflow"
+            exit 1
+          fi
+          
+          # Determine which application to deploy
+          if [ -n "${{ inputs.domain_name }}" ]; then
+            APP_DOMAIN="${{ inputs.domain_name }}"
+          else
+            # For tag push or empty input, deploy the first application
+            APP_DOMAIN=$(jq -r '.applications[0].domain' "$METADATA_FILE")
+          fi
+          
+          echo "Deploying application: $APP_DOMAIN"
+          
+          # Extract application details
+          APP_USERNAME=$(jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .username" "$METADATA_FILE")
+          APP_SERVICE=$(jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .service_name" "$METADATA_FILE")
+          DROPLET_IP=$(jq -r '.droplet.ip' "$METADATA_FILE")
+          
+          if [ -z "$APP_USERNAME" ] || [ "$APP_USERNAME" = "null" ]; then
+            echo "Error: Application $APP_DOMAIN not found in metadata"
+            echo ""
+            echo "Available applications:"
+            jq -r '.applications[] | "  - \(.domain)"' "$METADATA_FILE"
+            exit 1
+          fi
+          
+          echo "username=$APP_USERNAME" >> $GITHUB_OUTPUT
+          echo "service=$APP_SERVICE" >> $GITHUB_OUTPUT
+          echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+          echo "domain=$APP_DOMAIN" >> $GITHUB_OUTPUT
+          
+          echo "✓ Loaded metadata:"
+          echo "  - Username: $APP_USERNAME"
+          echo "  - Service: $APP_SERVICE"
+          echo "  - Droplet IP: $DROPLET_IP"
+      
+      - name: Setup SSH key for connection
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Add to known_hosts
+          ssh-keyscan -p 53222 -H ${{ steps.metadata.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      
+      - name: Create release directory on droplet
+        run: |
+          echo "Creating release directory for ${{ steps.tag.outputs.tag }}..."
+          
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "mkdir -p ~/releases/${{ steps.tag.outputs.tag }}/app"
+          
+          echo "✓ Release directory created: /home/${{ steps.metadata.outputs.username }}/releases/${{ steps.tag.outputs.tag }}/app"
+      
+      - name: Deploy application files
+        run: |
+          echo "Deploying application files..."
+          
+          APP_DIR="${{ inputs.app_directory || './app' }}"
+          
+          if [ ! -d "$APP_DIR" ]; then
+            echo "Error: Application directory $APP_DIR not found"
+            exit 1
+          fi
+          
+          # Check if rsync is available on remote server
+          if ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "command -v rsync >/dev/null 2>&1"; then
+            
+            echo "Using rsync for deployment..."
+            rsync -avz --delete \
+              -e "ssh -p 53222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+              "$APP_DIR/" \
+              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:~/releases/${{ steps.tag.outputs.tag }}/app/
+          else
+            echo "rsync not available, using scp..."
+            # Create tar archive and copy via scp
+            tar -czf /tmp/app.tar.gz -C "$APP_DIR" .
+            
+            scp -P 53222 \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              /tmp/app.tar.gz \
+              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
+            
+            # Extract on remote server
+            ssh -p 53222 \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+              "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
+            
+            rm /tmp/app.tar.gz
+          fi
+          
+          echo "✓ Application files deployed"
+      
+      - name: Set permissions
+        run: |
+          echo "Setting permissions..."
+          
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "chmod +x ~/releases/${{ steps.tag.outputs.tag }}/app/start.sh"
+          
+          echo "✓ Permissions set"
+      
+      - name: Switch symlink to new release
+        run: |
+          echo "Switching symlink to new release..."
+          
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "ln -sfn ~/releases/${{ steps.tag.outputs.tag }}/app ~/app"
+          
+          echo "✓ Symlink updated to point to ${{ steps.tag.outputs.tag }}"
+      
+      - name: Restart application service
+        run: |
+          echo "Restarting application service..."
+          
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "sudo systemctl restart ${{ steps.metadata.outputs.service }}"
+          
+          echo "✓ Service ${{ steps.metadata.outputs.service }} restarted"
+          
+          # Wait a moment for service to start
+          sleep 5
+      
+      - name: Verify service is running
+        run: |
+          echo "Verifying service status..."
+          
+          SERVICE_STATUS=$(ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "sudo systemctl is-active ${{ steps.metadata.outputs.service }}")
+          
+          if [ "$SERVICE_STATUS" != "active" ]; then
+            echo "Error: Service is not active (status: $SERVICE_STATUS)"
+            
+            # Get service logs for debugging
+            echo ""
+            echo "Service logs:"
+            ssh -p 53222 \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+              "sudo journalctl -u ${{ steps.metadata.outputs.service }} -n 50 --no-pager"
+            
+            exit 1
+          fi
+          
+          echo "✓ Service is active and running"
+      
+      - name: Health check
+        run: |
+          echo "Performing health check..."
+          
+          # Try to curl the application endpoint
+          MAX_ATTEMPTS=12
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              https://${{ steps.metadata.outputs.domain }} || echo "000")
+            
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
+              echo "✓ Health check passed (HTTP $HTTP_CODE)"
+              break
+            fi
+            
+            echo "Health check attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS (HTTP $HTTP_CODE)"
+            sleep 5
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "⚠️  Warning: Health check did not pass, but service is running"
+            echo "This may be normal if your application takes time to start"
+            echo "or if DNS has not fully propagated yet"
+          fi
+      
+      - name: Cleanup old releases
+        run: |
+          echo "Cleaning up old releases..."
+          
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            'cd ~/releases && ls -t | tail -n +4 | xargs -r rm -rf'
+          
+          echo "✓ Kept last 3 releases, removed older ones"
+          
+          # List remaining releases
+          echo ""
+          echo "Remaining releases:"
+          ssh -p 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "ls -1 ~/releases"
+      
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ steps.tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Application**: ${{ steps.metadata.outputs.domain }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Username**: ${{ steps.metadata.outputs.username }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: ${{ steps.metadata.outputs.service }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Droplet IP**: ${{ steps.metadata.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Access Your Application" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://${{ steps.metadata.outputs.domain }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Rollback Instructions" >> $GITHUB_STEP_SUMMARY
+          echo "If you need to rollback to a previous version:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p 53222 ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ls -1 ~/releases/  # List available versions" >> $GITHUB_STEP_SUMMARY
+          echo "ln -sfn ~/releases/v1.0.0/app ~/app  # Switch to desired version" >> $GITHUB_STEP_SUMMARY
+          echo "sudo systemctl restart ${{ steps.metadata.outputs.service }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
