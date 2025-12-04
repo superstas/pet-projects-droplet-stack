@@ -18,6 +18,8 @@ on:
 
 jobs:
   deploy:
+    if: ${{ !(github.repository == 'superstas/pet-projects-droplet-stack' && startsWith(github.ref, 'refs/tags/')) }} # Skip deploy for the template repository
+
     name: Deploy Application to Droplet
     runs-on: ubuntu-latest
     
@@ -112,7 +114,7 @@ jobs:
       
       - name: Deploy application files
         run: |
-          echo "Deploying application files..."
+          echo "Deploying application files using tar+scp..."
           
           APP_DIR="${{ inputs.app_directory || './app' }}"
           
@@ -121,38 +123,29 @@ jobs:
             exit 1
           fi
           
-          # Check if rsync is available on remote server
-          if ssh -p 53222 \
+          # Create tar archive locally
+          tar -czf /tmp/app.tar.gz -C "$APP_DIR" .
+          echo "✓ Created tar archive"
+          
+          # Transfer archive via scp
+          scp -P 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            /tmp/app.tar.gz \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
+          echo "✓ Transferred archive to remote server"
+          
+          # Extract on remote server and cleanup remote archive
+          ssh -p 53222 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "command -v rsync >/dev/null 2>&1"; then
-            
-            echo "Using rsync for deployment..."
-            rsync -avz --delete \
-              -e "ssh -p 53222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-              "$APP_DIR/" \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:~/releases/${{ steps.tag.outputs.tag }}/app/
-          else
-            echo "rsync not available, using scp..."
-            # Create tar archive and copy via scp
-            tar -czf /tmp/app.tar.gz -C "$APP_DIR" .
-            
-            scp -P 53222 \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              /tmp/app.tar.gz \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
-            
-            # Extract on remote server
-            ssh -p 53222 \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-              "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
-            
-            rm /tmp/app.tar.gz
-          fi
+            "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
+          echo "✓ Extracted archive on remote server"
+          
+          # Cleanup local archive
+          rm /tmp/app.tar.gz
+          echo "✓ Cleaned up temporary files"
           
           echo "✓ Application files deployed"
       
@@ -296,3 +289,643 @@ jobs:
           echo "ln -sfn ~/releases/v1.0.0/app ~/app  # Switch to desired version" >> $GITHUB_STEP_SUMMARY
           echo "sudo systemctl restart ${{ steps.metadata.outputs.service }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+  
+  create-release:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Extract current tag
+        id: current_tag
+        run: |
+          # Extract tag name from GITHUB_REF (refs/tags/v1.2.3 -> v1.2.3)
+          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$CURRENT_TAG" >> $GITHUB_OUTPUT
+          echo "Current tag: $CURRENT_TAG"
+      
+      - name: Find previous tag
+        id: previous_tag
+        continue-on-error: true
+        run: |
+          CURRENT_TAG="${{ steps.current_tag.outputs.tag }}"
+          
+          echo "🔍 Searching for previous tag before $CURRENT_TAG..."
+          
+          # Try to find the previous tag
+          # git describe --tags --abbrev=0 TAG^ finds the most recent tag before TAG
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || echo "")
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "ℹ️  No previous tag found - this is the first release"
+            echo "tag=" >> $GITHUB_OUTPUT
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "✓ Previous tag found: $PREVIOUS_TAG"
+            echo "tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Collect PR numbers from commits
+        id: collect_prs
+        continue-on-error: true
+        run: |
+          CURRENT_TAG="${{ steps.current_tag.outputs.tag }}"
+          PREVIOUS_TAG="${{ steps.previous_tag.outputs.tag }}"
+          
+          echo "🔍 Collecting commits between tags..."
+          
+          # Get commit messages and hashes between tags
+          if [ -z "$PREVIOUS_TAG" ]; then
+            # No previous tag - get all commits up to current tag
+            echo "ℹ️  Getting all commits up to $CURRENT_TAG (first release)"
+            COMMITS=$(git log --pretty=format:"%H|%s" "$CURRENT_TAG" 2>&1) || {
+              echo "⚠️  Error: Failed to get commit history"
+              echo "Git log error details: $COMMITS"
+              echo "commits=" >> $GITHUB_OUTPUT
+              echo "numbers=" >> $GITHUB_OUTPUT
+              echo "count=0" >> $GITHUB_OUTPUT
+              exit 0
+            }
+          else
+            # Get commits between previous and current tag
+            echo "ℹ️  Getting commits between $PREVIOUS_TAG and $CURRENT_TAG"
+            COMMITS=$(git log --pretty=format:"%H|%s" "${PREVIOUS_TAG}..${CURRENT_TAG}" 2>&1) || {
+              echo "⚠️  Error: Failed to get commit history between tags"
+              echo "Git log error details: $COMMITS"
+              echo "commits=" >> $GITHUB_OUTPUT
+              echo "numbers=" >> $GITHUB_OUTPUT
+              echo "count=0" >> $GITHUB_OUTPUT
+              exit 0
+            }
+          fi
+          
+          # Check if we got any commits
+          if [ -z "$COMMITS" ]; then
+            echo "ℹ️  No commits found between tags"
+            echo "commits=" >> $GITHUB_OUTPUT
+            echo "numbers=" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "✓ Found $(echo "$COMMITS" | wc -l) commit(s)"
+          
+          # Extract PR numbers from commit messages
+          # Patterns to match:
+          # - #123
+          # - (#123)
+          # - Merge pull request #123
+          # - PR #123
+          # - pull request #123
+          
+          echo "🔍 Extracting PR numbers from commit messages..."
+          PR_NUMBERS=$(echo "$COMMITS" | cut -d'|' -f2 | grep -oE '#[0-9]+|[Pp][Rr] #[0-9]+|[Mm]erge pull request #[0-9]+|pull request #[0-9]+|\(#[0-9]+\)' | \
+            grep -oE '[0-9]+' | \
+            sort -u | \
+            tr '\n' ' ' || echo "")
+          
+          # Remove trailing space and store
+          PR_NUMBERS=$(echo "$PR_NUMBERS" | sed 's/ $//')
+          
+          if [ -z "$PR_NUMBERS" ]; then
+            echo "ℹ️  No PR numbers found in commits (will use commit messages in release notes)"
+            echo "numbers=" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          else
+            echo "✓ Found PR numbers: $PR_NUMBERS"
+            PR_COUNT=$(echo "$PR_NUMBERS" | wc -w)
+            echo "numbers=$PR_NUMBERS" >> $GITHUB_OUTPUT
+            echo "count=$PR_COUNT" >> $GITHUB_OUTPUT
+            echo "✓ Found $PR_COUNT unique PR(s)"
+          fi
+          
+          # Store all commits for fallback (when no PRs found)
+          # Format: hash|message
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "✓ Commit collection completed successfully"
+      
+      - name: Fetch PR details from GitHub API
+        id: fetch_pr_details
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBERS="${{ steps.collect_prs.outputs.numbers }}"
+          
+          if [ -z "$PR_NUMBERS" ]; then
+            echo "ℹ️  No PRs to fetch (will use commit messages in release notes)"
+            echo "pr_data=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "🔍 Fetching details for PRs: $PR_NUMBERS"
+          
+          # Validate GitHub token is available
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "⚠️  Error: GITHUB_TOKEN is not available"
+            echo "Cannot fetch PR details without authentication"
+            echo "pr_data=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Function to call GitHub API with retry logic and error handling
+          call_github_api_with_retry() {
+            local pr_number="$1"
+            local max_attempts=3
+            local attempt=1
+            local wait_time=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "  Attempt $attempt/$max_attempts for PR #${pr_number}..." >&2
+              
+              # Make API request with error handling
+              response=$(curl -s -w "\n%{http_code}" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls/${pr_number}" \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" 2>&1) || {
+                echo "  ⚠️  Curl command failed for PR #${pr_number}" >&2
+                if [ $attempt -eq $max_attempts ]; then
+                  return 1
+                fi
+                sleep 1
+                attempt=$((attempt + 1))
+                continue
+              }
+              
+              http_code=$(echo "$response" | tail -n1)
+              body=$(echo "$response" | sed '$d')
+              
+              if [ "$http_code" = "200" ]; then
+                echo "$body"
+                return 0
+              elif [ "$http_code" = "403" ]; then
+                # Rate limiting - check if we should retry
+                echo "  ⚠️  Rate limited on attempt $attempt for PR #${pr_number}" >&2
+                
+                # Check rate limit headers if available
+                rate_limit_remaining=$(echo "$body" | jq -r '.message // ""' 2>/dev/null)
+                if [ -n "$rate_limit_remaining" ]; then
+                  echo "  Rate limit message: $rate_limit_remaining" >&2
+                fi
+                
+                if [ $attempt -lt $max_attempts ]; then
+                  echo "  Waiting ${wait_time}s before retry..." >&2
+                  sleep $wait_time
+                  wait_time=$((wait_time * 2))
+                else
+                  echo "  ⚠️  Max retry attempts reached, giving up on PR #${pr_number}" >&2
+                  return 1
+                fi
+              elif [ "$http_code" = "404" ]; then
+                echo "  ℹ️  PR #${pr_number} not found (404) - may have been deleted or is from a fork" >&2
+                return 1
+              elif [ "$http_code" = "401" ]; then
+                echo "  ⚠️  Authentication failed (401) for PR #${pr_number}" >&2
+                echo "  Check that GITHUB_TOKEN has correct permissions" >&2
+                return 1
+              else
+                echo "  ⚠️  API error for PR #${pr_number}: HTTP $http_code" >&2
+                if [ -n "$body" ]; then
+                  error_message=$(echo "$body" | jq -r '.message // ""' 2>/dev/null)
+                  if [ -n "$error_message" ] && [ "$error_message" != "null" ]; then
+                    echo "  Error message: $error_message" >&2
+                  fi
+                fi
+                
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "  ⚠️  Max retry attempts reached, giving up on PR #${pr_number}" >&2
+                  return 1
+                fi
+                sleep 1
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            
+            echo "  ⚠️  Failed to fetch PR #${pr_number} after $max_attempts attempts" >&2
+            return 1
+          }
+          
+          # Collect PR data in JSON format
+          PR_DATA="["
+          FIRST=true
+          SUCCESS_COUNT=0
+          FAILED_COUNT=0
+          
+          for pr_num in $PR_NUMBERS; do
+            echo ""
+            echo "📥 Fetching PR #${pr_num}..."
+            
+            pr_response=$(call_github_api_with_retry "$pr_num" 2>&1)
+            fetch_result=$?
+            
+            if [ $fetch_result -eq 0 ]; then
+              # Extract title and author from response with error handling
+              pr_title=$(echo "$pr_response" | jq -r '.title // "Unknown"' 2>/dev/null || echo "Unknown")
+              pr_author=$(echo "$pr_response" | jq -r '.user.login // "unknown"' 2>/dev/null || echo "unknown")
+              pr_url=$(echo "$pr_response" | jq -r '.html_url // ""' 2>/dev/null || echo "")
+              
+              # Validate extracted data
+              if [ "$pr_title" = "null" ] || [ -z "$pr_title" ]; then
+                echo "⚠️  Warning: Could not extract title for PR #${pr_num}, using 'Unknown'"
+                pr_title="Unknown"
+              fi
+              
+              if [ "$pr_author" = "null" ] || [ -z "$pr_author" ]; then
+                echo "⚠️  Warning: Could not extract author for PR #${pr_num}, using 'unknown'"
+                pr_author="unknown"
+              fi
+              
+              # Add to JSON array
+              if [ "$FIRST" = true ]; then
+                FIRST=false
+              else
+                PR_DATA="${PR_DATA},"
+              fi
+              
+              # Escape special characters in title for JSON
+              pr_title_escaped=$(echo "$pr_title" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+              
+              PR_DATA="${PR_DATA}{\"number\":${pr_num},\"title\":\"${pr_title_escaped}\",\"author\":\"${pr_author}\",\"url\":\"${pr_url}\"}"
+              
+              echo "✓ PR #${pr_num}: ${pr_title} (@${pr_author})"
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              echo "⚠️  Failed to fetch PR #${pr_num}, skipping (will not appear in release notes)"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+          done
+          
+          PR_DATA="${PR_DATA}]"
+          
+          # Store PR data in output
+          # Use multiline output format for JSON
+          echo "pr_data<<EOF" >> $GITHUB_OUTPUT
+          echo "$PR_DATA" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "📊 PR Fetch Summary:"
+          echo "  ✓ Successfully fetched: $SUCCESS_COUNT"
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo "  ⚠️  Failed to fetch: $FAILED_COUNT"
+          fi
+          
+          echo ""
+          echo "📋 Collected PR data:"
+          echo "$PR_DATA" | jq '.' 2>/dev/null || {
+            echo "⚠️  Warning: PR data is not valid JSON, outputting raw:"
+            echo "$PR_DATA"
+          }
+          
+          echo ""
+          echo "✓ PR details fetch completed"
+      
+      - name: Generate release notes
+        id: generate_notes
+        continue-on-error: true
+        run: |
+          CURRENT_TAG="${{ steps.current_tag.outputs.tag }}"
+          PREVIOUS_TAG="${{ steps.previous_tag.outputs.tag }}"
+          PR_DATA='${{ steps.fetch_pr_details.outputs.pr_data }}'
+          COMMITS='${{ steps.collect_prs.outputs.commits }}'
+          
+          echo "📝 Generating release notes for $CURRENT_TAG..."
+          
+          # Validate inputs
+          if [ -z "$CURRENT_TAG" ]; then
+            echo "⚠️  Error: Current tag is empty, cannot generate release notes"
+            echo "notes=# Release\n\nError: Could not determine release version" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Start building release notes
+          RELEASE_NOTES="# Release ${CURRENT_TAG}"
+          RELEASE_NOTES="${RELEASE_NOTES}\n"
+          RELEASE_NOTES="${RELEASE_NOTES}\n## Changes"
+          
+          # Add PR list if we have any
+          echo "🔍 Checking for PR data..."
+          PR_COUNT=$(echo "$PR_DATA" | jq '. | length' 2>/dev/null || echo "0")
+          
+          # Validate PR_COUNT is a number
+          if ! [[ "$PR_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "⚠️  Warning: Invalid PR count, defaulting to 0"
+            PR_COUNT=0
+          fi
+          
+          if [ "$PR_COUNT" -gt 0 ]; then
+            echo "✓ Adding $PR_COUNT PR(s) to release notes..."
+            
+            # Iterate through PRs and format them
+            for i in $(seq 0 $((PR_COUNT - 1))); do
+              pr_number=$(echo "$PR_DATA" | jq -r ".[$i].number" 2>/dev/null || echo "")
+              pr_title=$(echo "$PR_DATA" | jq -r ".[$i].title" 2>/dev/null || echo "Unknown")
+              pr_author=$(echo "$PR_DATA" | jq -r ".[$i].author" 2>/dev/null || echo "unknown")
+              
+              # Validate extracted data
+              if [ -z "$pr_number" ] || [ "$pr_number" = "null" ]; then
+                echo "⚠️  Warning: Skipping PR with invalid number at index $i"
+                continue
+              fi
+              
+              if [ "$pr_title" = "null" ]; then
+                pr_title="Unknown"
+              fi
+              
+              if [ "$pr_author" = "null" ]; then
+                pr_author="unknown"
+              fi
+              
+              # Format: - #123 Title (@author)
+              RELEASE_NOTES="${RELEASE_NOTES}\n- #${pr_number} ${pr_title} (@${pr_author})"
+              echo "  ✓ Added PR #${pr_number}"
+            done
+          else
+            echo "ℹ️  No PRs found, using commit messages instead..."
+            
+            # Use commit messages when no PRs are found (Requirement 2.5)
+            if [ -n "$COMMITS" ]; then
+              COMMIT_COUNT=0
+              while IFS='|' read -r commit_hash commit_message; do
+                # Skip empty lines
+                [ -z "$commit_hash" ] && continue
+                
+                # Skip "Merge pull request" commits (they duplicate PR information)
+                if echo "$commit_message" | grep -qiE "^Merge pull request #[0-9]+"; then
+                  echo "  Skipping merge commit: $commit_message"
+                  continue
+                fi
+                
+                # Get short hash (first 7 characters)
+                short_hash=$(echo "$commit_hash" | cut -c1-7 2>/dev/null || echo "$commit_hash")
+                
+                # Sanitize commit message (remove problematic characters)
+                commit_message=$(echo "$commit_message" | tr -d '\r' | head -c 200)
+                
+                # Create commit URL
+                commit_url="https://github.com/${GITHUB_REPOSITORY}/commit/${commit_hash}"
+                
+                # Format: - commit_message ([short_hash](url))
+                RELEASE_NOTES="${RELEASE_NOTES}\n- ${commit_message} ([\`${short_hash}\`](${commit_url}))"
+                COMMIT_COUNT=$((COMMIT_COUNT + 1))
+              done <<< "$COMMITS"
+              
+              if [ $COMMIT_COUNT -eq 0 ]; then
+                echo "⚠️  Warning: No valid commits found"
+                RELEASE_NOTES="${RELEASE_NOTES}\n- No changes found in this release"
+              else
+                echo "✓ Added $COMMIT_COUNT commit(s) to release notes"
+              fi
+            else
+              echo "ℹ️  No commits available"
+              RELEASE_NOTES="${RELEASE_NOTES}\n- No changes found in this release"
+            fi
+          fi
+          
+          # Add separator
+          RELEASE_NOTES="${RELEASE_NOTES}\n"
+          RELEASE_NOTES="${RELEASE_NOTES}\n---"
+          
+          # Add Full Changelog link
+          echo "🔗 Adding changelog link..."
+          if [ -n "$PREVIOUS_TAG" ]; then
+            RELEASE_NOTES="${RELEASE_NOTES}\n**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+            echo "✓ Added comparison link: ${PREVIOUS_TAG}...${CURRENT_TAG}"
+          else
+            # First release - link to all commits
+            RELEASE_NOTES="${RELEASE_NOTES}\n**Full Changelog**: https://github.com/${{ github.repository }}/commits/${CURRENT_TAG}"
+            echo "✓ Added commits link for first release"
+          fi
+          
+          # Store release notes in output using multiline format
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$RELEASE_NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "✓ Release notes generated successfully"
+          echo ""
+          echo "📄 Generated release notes:"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo -e "$RELEASE_NOTES"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      
+      - name: Create or update GitHub release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        run: |
+          CURRENT_TAG="${{ steps.current_tag.outputs.tag }}"
+          RELEASE_NOTES='${{ steps.generate_notes.outputs.notes }}'
+          
+          echo "🚀 Creating or updating release for $CURRENT_TAG..."
+          
+          # Validate inputs
+          if [ -z "$CURRENT_TAG" ]; then
+            echo "⚠️  Error: Current tag is empty, cannot create release"
+            exit 1
+          fi
+          
+          if [ -z "$RELEASE_NOTES" ]; then
+            echo "⚠️  Warning: Release notes are empty, using default message"
+            RELEASE_NOTES="# Release ${CURRENT_TAG}\n\nNo release notes available."
+          fi
+          
+          # Validate GitHub CLI is available
+          if ! command -v gh &> /dev/null; then
+            echo "⚠️  Error: GitHub CLI (gh) is not available"
+            echo "Cannot create release without gh command"
+            exit 1
+          fi
+          
+          # Validate authentication
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "⚠️  Error: GITHUB_TOKEN is not available"
+            echo "Cannot create release without authentication"
+            exit 1
+          fi
+          
+          # Check if release already exists
+          echo "🔍 Checking if release $CURRENT_TAG already exists..."
+          
+          RELEASE_EXISTS=$(gh release view "$CURRENT_TAG" --json id 2>/dev/null || echo "")
+          check_result=$?
+          
+          if [ $check_result -ne 0 ] && [ -z "$RELEASE_EXISTS" ]; then
+            echo "ℹ️  Release $CURRENT_TAG does not exist yet"
+          fi
+          
+          if [ -n "$RELEASE_EXISTS" ]; then
+            echo "ℹ️  Release $CURRENT_TAG already exists, updating..."
+            
+            # Update existing release
+            # Use --notes-file to handle multiline content properly
+            echo -e "$RELEASE_NOTES" > /tmp/release_notes.md || {
+              echo "⚠️  Error: Failed to write release notes to temporary file"
+              exit 1
+            }
+            
+            echo "📝 Updating release with new notes..."
+            gh release edit "$CURRENT_TAG" \
+              --notes-file /tmp/release_notes.md \
+              --title "$CURRENT_TAG" 2>&1 || {
+                echo "⚠️  Error: Failed to update release $CURRENT_TAG"
+                echo ""
+                echo "Attempting to get more details..."
+                gh release view "$CURRENT_TAG" 2>&1 || echo "Could not view release details"
+                
+                # Cleanup temp file
+                rm -f /tmp/release_notes.md 2>/dev/null || true
+                
+                echo ""
+                echo "Release update failed. This may be due to:"
+                echo "  - Insufficient permissions (needs 'contents: write')"
+                echo "  - Network connectivity issues"
+                echo "  - GitHub API rate limiting"
+                exit 1
+              }
+            
+            # Cleanup temp file
+            rm -f /tmp/release_notes.md 2>/dev/null || true
+            
+            # Get release URL
+            RELEASE_URL=$(gh release view "$CURRENT_TAG" --json url --jq '.url' 2>/dev/null || echo "")
+            
+            if [ -z "$RELEASE_URL" ]; then
+              echo "⚠️  Warning: Could not retrieve release URL"
+              RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${CURRENT_TAG}"
+            fi
+            
+            echo "✓ Release updated successfully: $RELEASE_URL"
+            echo "url=$RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "action=updated" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️  Release $CURRENT_TAG does not exist, creating new release..."
+            
+            # Create new release
+            # Use --notes-file to handle multiline content properly
+            echo -e "$RELEASE_NOTES" > /tmp/release_notes.md || {
+              echo "⚠️  Error: Failed to write release notes to temporary file"
+              exit 1
+            }
+            
+            echo "📝 Creating release with notes..."
+            gh release create "$CURRENT_TAG" \
+              --title "$CURRENT_TAG" \
+              --notes-file /tmp/release_notes.md 2>&1 || {
+                echo "⚠️  Error: Failed to create release $CURRENT_TAG"
+                echo ""
+                echo "Attempting to get more details..."
+                gh release list 2>&1 || echo "Could not list releases"
+                
+                # Cleanup temp file
+                rm -f /tmp/release_notes.md 2>/dev/null || true
+                
+                echo ""
+                echo "Release creation failed. This may be due to:"
+                echo "  - Tag does not exist in the repository"
+                echo "  - Insufficient permissions (needs 'contents: write')"
+                echo "  - Network connectivity issues"
+                echo "  - GitHub API rate limiting"
+                echo "  - Release with this tag already exists"
+                exit 1
+              }
+            
+            # Cleanup temp file
+            rm -f /tmp/release_notes.md 2>/dev/null || true
+            
+            # Get release URL
+            RELEASE_URL=$(gh release view "$CURRENT_TAG" --json url --jq '.url' 2>/dev/null || echo "")
+            
+            if [ -z "$RELEASE_URL" ]; then
+              echo "⚠️  Warning: Could not retrieve release URL"
+              RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${CURRENT_TAG}"
+            fi
+            
+            echo "✓ Release created successfully: $RELEASE_URL"
+            echo "url=$RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "action=created" >> $GITHUB_OUTPUT
+          fi
+          
+          echo ""
+          echo "✓ Release operation completed successfully"
+      
+      - name: Release summary
+        if: always()
+        run: |
+          echo "## 📦 Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if release creation was successful
+          if [ "${{ steps.create_release.outcome }}" = "success" ]; then
+            echo "### ✓ Release ${{ steps.create_release.outputs.action }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Tag**: ${{ steps.current_tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Release URL**: ${{ steps.create_release.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Action**: ${{ steps.create_release.outputs.action }}" >> $GITHUB_STEP_SUMMARY
+            
+            if [ -n "${{ steps.previous_tag.outputs.tag }}" ]; then
+              echo "- **Previous Tag**: ${{ steps.previous_tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Previous Tag**: None (first release)" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            # Add PR/commit statistics
+            PR_COUNT="${{ steps.collect_prs.outputs.count }}"
+            if [ -n "$PR_COUNT" ] && [ "$PR_COUNT" != "0" ]; then
+              echo "- **PRs Included**: $PR_COUNT" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Release Notes Preview" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '${{ steps.generate_notes.outputs.notes }}' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️  Release creation failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The release for tag ${{ steps.current_tag.outputs.tag }} could not be created or updated." >> $GITHUB_STEP_SUMMARY
+            echo "This does not affect the deployment. You can create the release manually if needed." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Tag**: ${{ steps.current_tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Add troubleshooting information
+            echo "### Troubleshooting" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Common causes for release creation failure:" >> $GITHUB_STEP_SUMMARY
+            echo "- Insufficient permissions (workflow needs \`contents: write\`)" >> $GITHUB_STEP_SUMMARY
+            echo "- GitHub API rate limiting" >> $GITHUB_STEP_SUMMARY
+            echo "- Network connectivity issues" >> $GITHUB_STEP_SUMMARY
+            echo "- Tag does not exist in repository" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Check the workflow logs above for detailed error messages." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To create the release manually:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "gh release create ${{ steps.current_tag.outputs.tag }} --title \"${{ steps.current_tag.outputs.tag }}\" --notes \"Release notes\"" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Add step outcomes for debugging
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Step Outcomes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Find previous tag**: ${{ steps.previous_tag.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Collect PRs**: ${{ steps.collect_prs.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fetch PR details**: ${{ steps.fetch_pr_details.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Generate notes**: ${{ steps.generate_notes.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Create release**: ${{ steps.create_release.outcome }}" >> $GITHUB_STEP_SUMMARY
