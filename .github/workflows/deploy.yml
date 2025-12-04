@@ -18,6 +18,8 @@ on:
 
 jobs:
   deploy:
+    if: ${{ !(github.repository == 'superstas/pet-projects-droplet-stack' && startsWith(github.ref, 'refs/tags/')) }} # Skip deploy for the template repository
+
     name: Deploy Application to Droplet
     runs-on: ubuntu-latest
     
