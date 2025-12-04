@@ -112,7 +112,7 @@ jobs:
       
       - name: Deploy application files
         run: |
-          echo "Deploying application files..."
+          echo "Deploying application files using tar+scp..."
           
           APP_DIR="${{ inputs.app_directory || './app' }}"
           
@@ -121,38 +121,29 @@ jobs:
             exit 1
           fi
           
-          # Check if rsync is available on remote server
-          if ssh -p 53222 \
+          # Create tar archive locally
+          tar -czf /tmp/app.tar.gz -C "$APP_DIR" .
+          echo "✓ Created tar archive"
+          
+          # Transfer archive via scp
+          scp -P 53222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            /tmp/app.tar.gz \
+            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
+          echo "✓ Transferred archive to remote server"
+          
+          # Extract on remote server and cleanup remote archive
+          ssh -p 53222 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "command -v rsync >/dev/null 2>&1"; then
-            
-            echo "Using rsync for deployment..."
-            rsync -avz --delete \
-              -e "ssh -p 53222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-              "$APP_DIR/" \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:~/releases/${{ steps.tag.outputs.tag }}/app/
-          else
-            echo "rsync not available, using scp..."
-            # Create tar archive and copy via scp
-            tar -czf /tmp/app.tar.gz -C "$APP_DIR" .
-            
-            scp -P 53222 \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              /tmp/app.tar.gz \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
-            
-            # Extract on remote server
-            ssh -p 53222 \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-              "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
-            
-            rm /tmp/app.tar.gz
-          fi
+            "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
+          echo "✓ Extracted archive on remote server"
+          
+          # Cleanup local archive
+          rm /tmp/app.tar.gz
+          echo "✓ Cleaned up temporary files"
           
           echo "✓ Application files deployed"
       
