@@ -61,6 +61,12 @@ Unit tests use the Bats (Bash Automated Testing System) framework to test bash s
 **Unit Test Files:**
 - `test_config_validation.bats` - Configuration file syntax validation
 - `test_script_functions.bats` - Bash script function testing
+- `test_pr_extraction.bats` - PR number extraction from commit messages
+- `test_release_notes_generation.bats` - Release notes formatting and generation
+- `test_template_repository.bats` - Template repository workflow behavior
+
+**Test Helper Scripts:**
+- `generate-release-notes.sh` - Helper script for testing release notes generation logic (extracted from workflow)
 
 ## Requirements
 
