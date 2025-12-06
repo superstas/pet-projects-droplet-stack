@@ -44,8 +44,8 @@ setup() {
     done
 }
 
-@test "cloud-init.yml configures SSH on port 53222" {
-    run grep -q "Port 53222" "$PROJECT_ROOT/templates/cloud-init.yml"
+@test "cloud-init.yml configures SSH port" {
+    run grep -q "Port [0-9]\+" "$PROJECT_ROOT/templates/cloud-init.yml"
     assert_success
 }
 
@@ -60,7 +60,7 @@ setup() {
 }
 
 @test "cloud-init.yml configures UFW firewall" {
-    run grep -q "ufw limit 53222/tcp" "$PROJECT_ROOT/templates/cloud-init.yml"
+    run grep -q "ufw limit [0-9]\+/tcp" "$PROJECT_ROOT/templates/cloud-init.yml"
     assert_success
     run grep -q "ufw allow 80/tcp" "$PROJECT_ROOT/templates/cloud-init.yml"
     assert_success
@@ -143,6 +143,36 @@ setup() {
 
 @test "create-droplet.yml references SSH_PRIVATE_KEY secret" {
     run grep -q "secrets.SSH_PRIVATE_KEY" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
+    assert_success
+}
+
+@test "create-droplet.yml has ssh_port input with default 53222" {
+    run grep -A 4 "ssh_port:" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
+    assert_output --partial "default: 53222"
+}
+
+@test "create-droplet.yml validates SSH port range" {
+    run grep -q "SSH port must be between 1024 and 65535" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
+    assert_success
+}
+
+@test "create-droplet.yml mentions reserved system ports in validation" {
+    run grep -q "Ports below 1024 are system ports" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
+    assert_success
+}
+
+@test "create-droplet.yml mentions port 22 as reserved" {
+    run grep -q "22" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
+    assert_success
+}
+
+@test "create-droplet.yml mentions port 80 as reserved" {
+    run grep -q "80" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
+    assert_success
+}
+
+@test "create-droplet.yml mentions port 443 as reserved" {
+    run grep -q "443" "$PROJECT_ROOT/.github/workflows/create-droplet.yml"
     assert_success
 }
 

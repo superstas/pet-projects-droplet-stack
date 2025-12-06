@@ -80,6 +80,19 @@ jobs:
           echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
           echo "✓ Droplet IP resolved: $DROPLET_IP"
       
+      - name: Load SSH port from metadata
+        id: ssh-config
+        run: |
+          echo "Loading SSH port configuration..."
+          
+          METADATA_FILE=".github/deployments/metadata.json"
+          
+          # Extract SSH port from metadata with fallback to 53222
+          SSH_PORT=$(jq -r '.droplet.ssh_port // 53222' "$METADATA_FILE")
+          
+          echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
+          echo "✓ SSH port configured: $SSH_PORT"
+      
       - name: Check DNS resolution
         id: dns-check
         run: |
@@ -184,7 +197,7 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts
-          ssh-keyscan -p 53222 -H ${{ steps.resolve-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ steps.resolve-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Determine admin username
         id: admin-user
@@ -210,7 +223,7 @@ jobs:
           echo "Copying setup-ssl.sh to droplet..."
           ADMIN_USER="${{ steps.admin-user.outputs.username }}"
           
-          scp -P 53222 \
+          scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             scripts/setup-ssl.sh \
@@ -226,7 +239,7 @@ jobs:
           ADMIN_USER="${{ steps.admin-user.outputs.username }}"
           
           # Make script executable and run it with sudo
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${ADMIN_USER}@${{ steps.resolve-ip.outputs.ip }} \
