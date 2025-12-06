@@ -91,6 +91,14 @@ jobs:
           echo "  - Service: $APP_SERVICE"
           echo "  - Droplet IP: $DROPLET_IP"
       
+      - name: Load SSH port from metadata
+        id: ssh-config
+        run: |
+          METADATA_FILE=".github/deployments/metadata.json"
+          SSH_PORT=$(jq -r '.droplet.ssh_port // 53222' "$METADATA_FILE")
+          echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
+          echo "✓ SSH port configured: $SSH_PORT"
+      
       - name: Setup SSH key for connection
         run: |
           mkdir -p ~/.ssh
@@ -98,13 +106,13 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts
-          ssh-keyscan -p 53222 -H ${{ steps.metadata.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ steps.metadata.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Create release directory on droplet
         run: |
           echo "Creating release directory for ${{ steps.tag.outputs.tag }}..."
           
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -128,7 +136,7 @@ jobs:
           echo "✓ Created tar archive"
           
           # Transfer archive via scp
-          scp -P 53222 \
+          scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             /tmp/app.tar.gz \
@@ -136,7 +144,7 @@ jobs:
           echo "✓ Transferred archive to remote server"
           
           # Extract on remote server and cleanup remote archive
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -153,7 +161,7 @@ jobs:
         run: |
           echo "Setting permissions..."
           
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -165,7 +173,7 @@ jobs:
         run: |
           echo "Switching symlink to new release..."
           
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -177,7 +185,7 @@ jobs:
         run: |
           echo "Restarting application service..."
           
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -192,7 +200,7 @@ jobs:
         run: |
           echo "Verifying service status..."
           
-          SERVICE_STATUS=$(ssh -p 53222 \
+          SERVICE_STATUS=$(ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -204,7 +212,7 @@ jobs:
             # Get service logs for debugging
             echo ""
             echo "Service logs:"
-            ssh -p 53222 \
+            ssh -p ${{ steps.ssh-config.outputs.port }} \
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -249,7 +257,7 @@ jobs:
         run: |
           echo "Cleaning up old releases..."
           
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -260,7 +268,7 @@ jobs:
           # List remaining releases
           echo ""
           echo "Remaining releases:"
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
@@ -284,7 +292,7 @@ jobs:
           echo "### Rollback Instructions" >> $GITHUB_STEP_SUMMARY
           echo "If you need to rollback to a previous version:" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p 53222 ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p ${{ steps.ssh-config.outputs.port }} ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo "ls -1 ~/releases/  # List available versions" >> $GITHUB_STEP_SUMMARY
           echo "ln -sfn ~/releases/v1.0.0/app ~/app  # Switch to desired version" >> $GITHUB_STEP_SUMMARY
           echo "sudo systemctl restart ${{ steps.metadata.outputs.service }}" >> $GITHUB_STEP_SUMMARY

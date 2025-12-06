@@ -91,6 +91,17 @@ jobs:
           echo "✓ Port $NEW_PORT is available"
           echo "port_available=true" >> $GITHUB_OUTPUT
       
+      - name: Load SSH port from metadata
+        id: ssh-config
+        run: |
+          echo "Loading SSH port from metadata..."
+          
+          METADATA_FILE=".github/deployments/metadata.json"
+          SSH_PORT=$(jq -r '.droplet.ssh_port // 53222' "$METADATA_FILE")
+          
+          echo "SSH port: $SSH_PORT"
+          echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
+      
       - name: Setup SSH key for connection
         run: |
           mkdir -p ~/.ssh
@@ -98,7 +109,7 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts
-          ssh-keyscan -p 53222 -H ${{ inputs.droplet_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ inputs.droplet_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Add admin_username input parameter
         run: |
@@ -113,7 +124,7 @@ jobs:
           # Use 'admin' as default admin username (can be overridden via workflow_dispatch input if needed)
           ADMIN_USER="admin"
           
-          scp -P 53222 \
+          scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             scripts/setup-application.sh \
@@ -129,7 +140,7 @@ jobs:
           ADMIN_USER="admin"
           
           # Make script executable and run it with sudo
-          ssh -p 53222 \
+          ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${ADMIN_USER}@${{ inputs.droplet_ip }} \
@@ -210,12 +221,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Admin access (for server administration):**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p 53222 admin@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p ${{ steps.ssh-config.outputs.port }} admin@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Application user access (can deploy and restart own service):**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p 53222 ${{ steps.setup-app.outputs.username }}@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p ${{ steps.ssh-config.outputs.port }} ${{ steps.setup-app.outputs.username }}@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY

@@ -96,6 +96,11 @@ def test_adding_application_preserves_existing_scrape_targets(existing_domains, 
     # Ensure new domain is not in existing domains
     assume(new_domain not in existing_domains)
     
+    # Ensure sanitized usernames are unique (no collisions)
+    existing_usernames = [sanitize_domain(d) for d in existing_domains]
+    new_username = sanitize_domain(new_domain)
+    assume(new_username not in existing_usernames)
+    
     # Start with basic Prometheus config
     config = """
 global:
@@ -128,8 +133,7 @@ scrape_configs:
     # Extract job names and configurations before
     jobs_before = {job['job_name']: job for job in targets_before}
     
-    # Add new application
-    new_username = sanitize_domain(new_domain)
+    # Add new application (new_username already computed above)
     assume(len(new_username) > 0)
     config = add_prometheus_scrape_target(config, new_username, new_domain, new_port, "/metrics")
     

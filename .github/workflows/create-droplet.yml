@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: 'admin'
+      ssh_port:
+        description: 'SSH port for server access (default: 53222)'
+        required: false
+        type: number
+        default: 53222
 
 env:
   DROPLET_SIZE: s-1vcpu-512mb-10gb
@@ -84,6 +89,22 @@ jobs:
           fi
           
           echo "✓ All inputs are valid"
+      
+      - name: Validate SSH port
+        run: |
+          echo "Validating SSH port..."
+          
+          SSH_PORT="${{ inputs.ssh_port }}"
+          
+          # Check port range (1024-65535)
+          # Ports below 1024 are system ports and include commonly reserved ports like 22 (default SSH), 80 (HTTP), 443 (HTTPS)
+          if [ "$SSH_PORT" -lt 1024 ] || [ "$SSH_PORT" -gt 65535 ]; then
+            echo "Error: SSH port must be between 1024 and 65535"
+            echo "Provided: $SSH_PORT"
+            exit 1
+          fi
+          
+          echo "✓ SSH port $SSH_PORT is valid"
       
       - name: Generate droplet name
         id: droplet-name
@@ -134,9 +155,14 @@ jobs:
           fi
           
           ADMIN_USERNAME="${{ inputs.ssh_authorized_username }}"
+          SSH_PORT="${{ inputs.ssh_port }}"
           
-          # Create temporary cloud-init with admin user
+          # Create temporary cloud-init with configured SSH port
           cp templates/cloud-init.yml /tmp/cloud-init-custom.yml
+          
+          # Replace hardcoded SSH port with configured port
+          sed -i "s/Port 53222/Port ${SSH_PORT}/" /tmp/cloud-init-custom.yml
+          sed -i "s/ufw limit 53222\\/tcp/ufw limit ${SSH_PORT}\\/tcp/" /tmp/cloud-init-custom.yml
           
           # Add admin user configuration
           cat >> /tmp/cloud-init-custom.yml << EOF
@@ -158,6 +184,7 @@ jobs:
           done
           
           echo "✓ Cloud-init prepared with admin user: ${ADMIN_USERNAME}"
+          echo "✓ SSH port configured: ${SSH_PORT}"
       
       - name: Create droplet with cloud-init
         id: create-droplet
@@ -213,15 +240,16 @@ jobs:
       
       - name: Wait for SSH to be available
         run: |
-          echo "Waiting for SSH on port 53222..."
+          SSH_PORT="${{ inputs.ssh_port }}"
+          echo "Waiting for SSH on port $SSH_PORT..."
           
           IP="${{ steps.droplet-ip.outputs.ip }}"
           MAX_ATTEMPTS=60
           ATTEMPT=0
           
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$IP/53222" 2>/dev/null; then
-              echo "✓ SSH port 53222 is available"
+            if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$IP/$SSH_PORT" 2>/dev/null; then
+              echo "✓ SSH port $SSH_PORT is available"
               break
             fi
             
@@ -242,7 +270,7 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts
-          ssh-keyscan -p 53222 -H ${{ steps.droplet-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p ${{ inputs.ssh_port }} -H ${{ steps.droplet-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Wait for cloud-init to complete
         run: |
@@ -258,7 +286,7 @@ jobs:
           while [ $CLOUD_INIT_ATTEMPT -lt $MAX_CLOUD_INIT_ATTEMPTS ]; do
             # Check if nginx is installed (indicates cloud-init packages are done)
             echo "Checking if nginx is installed (attempt $((CLOUD_INIT_ATTEMPT + 1))/$MAX_CLOUD_INIT_ATTEMPTS)..."
-            NGINX_CHECK=$(ssh -p 53222 \
+            NGINX_CHECK=$(ssh -p ${{ inputs.ssh_port }} \
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=5 \
@@ -290,7 +318,7 @@ jobs:
           echo "Copying setup-application.sh to droplet..."
           ADMIN_USER="${{ inputs.ssh_authorized_username }}"
           
-          scp -P 53222 \
+          scp -P ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             scripts/setup-application.sh \
@@ -305,7 +333,7 @@ jobs:
           ADMIN_USER="${{ inputs.ssh_authorized_username }}"
           
           # Make script executable and run it with sudo
-          ssh -p 53222 \
+          ssh -p ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${ADMIN_USER}@${{ steps.droplet-ip.outputs.ip }} \
@@ -339,7 +367,8 @@ jobs:
               "ip": "${{ steps.droplet-ip.outputs.ip }}",
               "region": "${{ inputs.region }}",
               "size": "${{ env.DROPLET_SIZE }}",
-              "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "ssh_port": ${{ inputs.ssh_port }}
             },
             "applications": [
               {
@@ -392,12 +421,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Admin access (for server administration):**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p 53222 ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Application user access (limited, no sudo):**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p 53222 ${{ steps.setup-app.outputs.username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p ${{ inputs.ssh_port }} ${{ steps.setup-app.outputs.username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚠️ Important: Configure DNS Records" >> $GITHUB_STEP_SUMMARY
@@ -430,7 +459,7 @@ jobs:
           echo "   **Option B: Run manually via SSH**" >> $GITHUB_STEP_SUMMARY
           echo '   ```bash' >> $GITHUB_STEP_SUMMARY
           echo "   # Note: Password authentication is disabled, use SSH key" >> $GITHUB_STEP_SUMMARY
-          echo "   ssh -p 53222 -i /path/to/your/private_key ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "   ssh -p ${{ inputs.ssh_port }} -i /path/to/your/private_key ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo "   sudo ./scripts/setup-ssl.sh ${{ inputs.domain_name }} ${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo '   ```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -448,6 +477,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Access Prometheus metrics via SSH tunnel:" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p 53222 -L 9090:localhost:9090 ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "ssh -p ${{ inputs.ssh_port }} -L 9090:localhost:9090 ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo "# Then open http://localhost:9090 in your browser" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
