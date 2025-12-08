@@ -206,13 +206,16 @@ jobs:
           
           METADATA_FILE=".github/deployments/metadata.json"
           
-          # Default to 'admin' if metadata doesn't exist
+          # Default to 'admin' if metadata doesn't exist or doesn't have ssh_user
           ADMIN_USER="admin"
           
           if [ -f "$METADATA_FILE" ]; then
-            # Try to extract admin username from metadata if available
-            # For now, we'll use the default 'admin' as it's the standard
-            echo "Using default admin username: admin"
+            # Extract admin username from metadata
+            METADATA_USER=$(jq -r '.droplet.ssh_user // "admin"' "$METADATA_FILE")
+            ADMIN_USER="$METADATA_USER"
+            echo "Found admin username in metadata: $ADMIN_USER"
+          else
+            echo "Metadata file not found, using default: admin"
           fi
           
           echo "username=$ADMIN_USER" >> $GITHUB_OUTPUT
@@ -226,7 +229,7 @@ jobs:
           scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            scripts/setup-ssl.sh \
+            infra/scripts/setup-ssl.sh \
             ${ADMIN_USER}@${{ steps.resolve-ip.outputs.ip }}:/tmp/setup-ssl.sh
           
           echo "✓ Script copied successfully"
@@ -264,7 +267,7 @@ jobs:
           # Test HTTPS endpoint
           echo "Testing HTTPS endpoint: $HTTPS_URL"
           
-          HTTP_CODE=$(curl -f -s -o /dev/null -w "%{http_code}" --max-time 15 "$HTTPS_URL" 2>/dev/null || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$HTTPS_URL" 2>/dev/null || echo "000")
           
           if [ "$HTTP_CODE" = "000" ]; then
             echo "⚠️  Could not connect to HTTPS endpoint"
