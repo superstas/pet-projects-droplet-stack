@@ -127,7 +127,7 @@ jobs:
           scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            scripts/setup-application.sh \
+            infra/scripts/setup-application.sh \
             ${ADMIN_USER}@${{ inputs.droplet_ip }}:/tmp/setup-application.sh
           
           echo "✓ Script copied successfully"

@@ -158,7 +158,7 @@ jobs:
           SSH_PORT="${{ inputs.ssh_port }}"
           
           # Create temporary cloud-init with configured SSH port
-          cp templates/cloud-init.yml /tmp/cloud-init-custom.yml
+          cp infra/templates/cloud-init.yml /tmp/cloud-init-custom.yml
           
           # Replace hardcoded SSH port with configured port
           sed -i "s/Port 53222/Port ${SSH_PORT}/" /tmp/cloud-init-custom.yml
@@ -277,41 +277,43 @@ jobs:
           IP="${{ steps.droplet-ip.outputs.ip }}"
           ADMIN_USER="${{ inputs.ssh_authorized_username }}"
           
-          # Wait for cloud-init to complete by checking if nginx is installed
-          echo "Waiting for cloud-init to complete (checking for nginx installation)..."
+          echo "Waiting for cloud-init to complete..."
           echo "Using admin user: $ADMIN_USER"
-          MAX_CLOUD_INIT_ATTEMPTS=30
-          CLOUD_INIT_ATTEMPT=0
           
-          while [ $CLOUD_INIT_ATTEMPT -lt $MAX_CLOUD_INIT_ATTEMPTS ]; do
-            # Check if nginx is installed (indicates cloud-init packages are done)
-            echo "Checking if nginx is installed (attempt $((CLOUD_INIT_ATTEMPT + 1))/$MAX_CLOUD_INIT_ATTEMPTS)..."
-            NGINX_CHECK=$(ssh -p ${{ inputs.ssh_port }} \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -o ConnectTimeout=5 \
-              ${ADMIN_USER}@$IP \
-              "sudo which nginx 2>&1 || dpkg -l nginx 2>&1 | grep -q '^ii' && echo '/usr/sbin/nginx' || echo 'not found'" 2>&1)
-            
-            if echo "$NGINX_CHECK" | grep -q "/nginx"; then
-              echo "✓ Nginx is installed at: $NGINX_CHECK"
-              break
-            fi
-            
-            if echo "$NGINX_CHECK" | grep -q "Permission denied"; then
-              echo "Error: SSH authentication failed for user $ADMIN_USER"
-              echo "Please verify that the SSH key is correct and the admin user is properly configured"
+          # Use cloud-init status --wait to wait for completion (with timeout)
+          # This ensures all packages are installed AND all runcmd scripts have executed
+          ssh -p ${{ inputs.ssh_port }} \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=5 \
+            -o ServerAliveCountMax=3 \
+            ${ADMIN_USER}@$IP \
+            "sudo cloud-init status --wait --long" || {
+              echo "Error: cloud-init did not complete successfully"
+              echo "Checking cloud-init status..."
+              ssh -p ${{ inputs.ssh_port }} \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                ${ADMIN_USER}@$IP \
+                "sudo cloud-init status --long" || true
               exit 1
-            fi
-            
-            echo "Waiting for package installation..."
-            sleep 10
-            CLOUD_INIT_ATTEMPT=$((CLOUD_INIT_ATTEMPT + 1))
-          done
+            }
           
-          if [ $CLOUD_INIT_ATTEMPT -eq $MAX_CLOUD_INIT_ATTEMPTS ]; then
-            echo "Warning: Nginx was not detected in expected time, continuing anyway..."
-          fi
+          echo "✓ Cloud-init completed successfully"
+          
+          # Verify nginx configuration exists
+          echo "Verifying nginx configuration..."
+          ssh -p ${{ inputs.ssh_port }} \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${ADMIN_USER}@$IP \
+            "sudo test -f /etc/nginx/nginx.conf && sudo nginx -t" || {
+              echo "Error: Nginx configuration is missing or invalid"
+              exit 1
+            }
+          
+          echo "✓ Nginx is properly configured"
       
       - name: Copy setup script to droplet
         run: |
@@ -321,7 +323,7 @@ jobs:
           scp -P ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            scripts/setup-application.sh \
+            infra/scripts/setup-application.sh \
             ${ADMIN_USER}@${{ steps.droplet-ip.outputs.ip }}:/tmp/setup-application.sh
           
           echo "✓ Script copied successfully"
@@ -368,7 +370,8 @@ jobs:
               "region": "${{ inputs.region }}",
               "size": "${{ env.DROPLET_SIZE }}",
               "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "ssh_port": ${{ inputs.ssh_port }}
+              "ssh_port": ${{ inputs.ssh_port }},
+              "ssh_user": "${{ inputs.ssh_authorized_username }}"
             },
             "applications": [
               {
@@ -460,7 +463,7 @@ jobs:
           echo '   ```bash' >> $GITHUB_STEP_SUMMARY
           echo "   # Note: Password authentication is disabled, use SSH key" >> $GITHUB_STEP_SUMMARY
           echo "   ssh -p ${{ inputs.ssh_port }} -i /path/to/your/private_key ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
-          echo "   sudo ./scripts/setup-ssl.sh ${{ inputs.domain_name }} ${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "   sudo ./infra/scripts/setup-ssl.sh ${{ inputs.domain_name }} ${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo '   ```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "4. **Deploy your application** - Create a release tag (e.g., v1.0.0)" >> $GITHUB_STEP_SUMMARY

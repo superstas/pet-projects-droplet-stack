@@ -115,6 +115,30 @@ git push origin v1.0.0
 
 The workflow automatically deploys to your server.
 
+## Repository Structure
+
+```
+/
+├── .github/          # GitHub Actions workflows for automation
+│   └── workflows/    # CI/CD pipelines for provisioning and deployment
+├── app/              # Your application code and assets
+│   ├── start.sh      # Application startup script
+│   └── static/       # Static files served by Nginx
+├── infra/            # Infrastructure provisioning and testing
+│   ├── scripts/      # Server setup and configuration scripts
+│   ├── templates/    # Cloud-init and configuration templates
+│   ├── tests/        # Infrastructure tests (Python + BATS)
+│   ├── Makefile      # Test execution targets
+│   └── README.md     # Infrastructure documentation
+└── README.md         # This file
+```
+
+### Infrastructure Organization
+
+All infrastructure-related components (provisioning scripts, templates, and tests) are organized in the `infra/` directory. This separation keeps application code distinct from infrastructure code, making the repository easier to navigate and maintain.
+
+For infrastructure development and testing, see [infra/README.md](infra/README.md).
+
 ## License
 
 MIT License - see LICENSE file for details
