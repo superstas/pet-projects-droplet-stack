@@ -22,36 +22,58 @@ setup() {
 
 @test "sanitize_domain: converts uppercase to lowercase" {
     result=$(sanitize_domain "EXAMPLE.COM")
+    # Should be lowercase, no hash suffix, total 32 chars or less
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
+    # Should be exactly the sanitized domain part
     assert_equal "$result" "examplecom"
 }
 
 @test "sanitize_domain: removes dots" {
     result=$(sanitize_domain "example.com")
+    # Should remove dots, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "examplecom"
 }
 
 @test "sanitize_domain: removes hyphens" {
     result=$(sanitize_domain "my-app.example.com")
+    # Should remove hyphens, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "myappexamplecom"
 }
 
 @test "sanitize_domain: removes underscores" {
     result=$(sanitize_domain "my_app.example.com")
+    # Should remove underscores, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "myappexamplecom"
 }
 
 @test "sanitize_domain: removes special characters" {
     result=$(sanitize_domain "my@app!.example#.com")
+    # Should remove special characters, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "myappexamplecom"
 }
 
 @test "sanitize_domain: preserves alphanumeric characters" {
     result=$(sanitize_domain "app123.example456.com")
+    # Should preserve alphanumeric, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "app123example456com"
 }
 
 @test "sanitize_domain: handles mixed case with special chars" {
     result=$(sanitize_domain "My-App_123.Example.COM")
+    # Should convert to lowercase, remove special chars, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "myapp123examplecom"
 }
 
@@ -66,27 +88,39 @@ setup() {
 
 @test "sanitize_domain: handles empty string" {
     result=$(sanitize_domain "")
+    # Empty string should result in empty string (no hash suffix anymore)
     assert_equal "$result" ""
+    assert_equal "${#result}" "0"
 }
 
 @test "sanitize_domain: handles only special characters" {
     result=$(sanitize_domain "!@#$%^&*()")
+    # Special chars removed, should result in empty string (no hash suffix anymore)
     assert_equal "$result" ""
+    assert_equal "${#result}" "0"
 }
 
 @test "sanitize_domain: handles unicode characters" {
     result=$(sanitize_domain "café.example.com")
-    # Unicode characters should be removed, leaving only alphanumeric
+    # Unicode characters should be removed, leaving only alphanumeric, no hash
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "cafexamplecom"
 }
 
 @test "sanitize_domain: handles subdomain" {
     result=$(sanitize_domain "api.myapp.example.com")
+    # Should handle subdomain, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "apimyappexamplecom"
 }
 
 @test "sanitize_domain: handles www prefix" {
     result=$(sanitize_domain "www.example.com")
+    # Should handle www prefix, no hash suffix
+    [[ "$result" =~ ^[a-z0-9]+$ ]]
+    [[ "${#result}" -le 32 ]]
     assert_equal "$result" "wwwexamplecom"
 }
 

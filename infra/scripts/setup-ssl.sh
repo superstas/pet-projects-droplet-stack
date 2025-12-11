@@ -5,11 +5,12 @@ set -o pipefail
 # setup-ssl.sh
 # Script to configure SSL certificate for an existing application
 #
-# Usage: setup-ssl.sh <domain_name> <droplet_ip>
+# Usage: setup-ssl.sh <domain_name> <droplet_ip> [username]
 #
 # Parameters:
 #   $1 - domain_name: Domain name for the application (e.g., example.com)
 #   $2 - droplet_ip: IP address of the droplet
+#   $3 - username: Application username (optional, will be generated from domain if not provided)
 #
 
 # Color codes for output
@@ -43,8 +44,10 @@ sanitize_domain() {
     # Remove all non-alphanumeric characters
     sanitized=$(echo "$sanitized" | sed 's/[^a-z0-9]//g')
     
-    # Truncate to 32 characters
-    sanitized=$(echo "$sanitized" | cut -c1-32)
+    # Truncate to 32 characters max (Linux username limit)
+    if [ ${#sanitized} -gt 32 ]; then
+        sanitized=$(echo "$sanitized" | cut -c1-32)
+    fi
     
     echo "$sanitized"
 }
@@ -142,13 +145,14 @@ validate_dns() {
 }
 
 # Validate arguments
-if [ "$#" -ne 2 ]; then
-    log_error "Usage: $0 <domain_name> <droplet_ip>"
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    log_error "Usage: $0 <domain_name> <droplet_ip> [username]"
     exit 1
 fi
 
 DOMAIN_NAME="$1"
 DROPLET_IP="$2"
+PROVIDED_USERNAME="$3"
 
 # Validate inputs
 if [ -z "$DOMAIN_NAME" ]; then
@@ -167,11 +171,17 @@ if ! [[ "$DROPLET_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; th
     exit 1
 fi
 
-# Generate username from domain
-USERNAME=$(sanitize_domain "$DOMAIN_NAME")
+# Use provided username or generate from domain
+if [ -n "$PROVIDED_USERNAME" ] && [ "$PROVIDED_USERNAME" != "null" ]; then
+    USERNAME="$PROVIDED_USERNAME"
+    log_info "Using provided username: $USERNAME"
+else
+    USERNAME=$(sanitize_domain "$DOMAIN_NAME")
+    log_info "Generated username from domain: $USERNAME"
+fi
 
 if [ -z "$USERNAME" ]; then
-    log_error "Failed to generate valid username from domain: $DOMAIN_NAME"
+    log_error "Failed to determine valid username for domain: $DOMAIN_NAME"
     exit 1
 fi
 

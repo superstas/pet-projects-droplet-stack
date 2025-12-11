@@ -129,7 +129,13 @@ def test_nginx_config_structure_is_valid(domain, port):
     all required nginx directives and blocks.
     """
     # Sanitize domain to create username
-    username = re.sub(r'[^a-z0-9]', '', domain.lower())[:32]
+    import hashlib
+    sanitized = re.sub(r'[^a-z0-9]', '', domain.lower())
+    hash_suffix = hashlib.md5(domain.encode()).hexdigest()[:6]
+    max_base_len = 26
+    if len(sanitized) > max_base_len:
+        sanitized = sanitized[:max_base_len]
+    username = sanitized + hash_suffix
     
     if not username:  # Skip if username is empty
         return

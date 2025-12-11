@@ -60,11 +60,19 @@ jobs:
     name: Create and Configure Droplet
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Allow pushing metadata.json to repository
+      contents: read   # Required for reading repository content
+      actions: write   # Required for managing GitHub Actions Variables
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      
+      - name: Setup metadata helpers
+        run: |
+          # Copy metadata helper functions to a temporary location
+          cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
+          chmod +x /tmp/metadata-helpers.sh
+          echo "✓ Metadata helper functions ready"
       
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
@@ -183,8 +191,8 @@ jobs:
             fi
           done
           
-          echo "✓ Cloud-init prepared with admin user: ${ADMIN_USERNAME}"
-          echo "✓ SSH port configured: ${SSH_PORT}"
+          echo "✓ Cloud-init prepared with admin user configuration"
+          echo "✓ SSH port configured successfully"
       
       - name: Create droplet with cloud-init
         id: create-droplet
@@ -236,20 +244,20 @@ jobs:
           # Get IP address
           IP_ADDRESS=$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header)
           echo "ip=$IP_ADDRESS" >> $GITHUB_OUTPUT
-          echo "✓ Droplet IP address: $IP_ADDRESS"
+          echo "✓ Droplet IP address resolved successfully"
       
       - name: Wait for SSH to be available
         run: |
-          SSH_PORT="${{ inputs.ssh_port }}"
-          echo "Waiting for SSH on port $SSH_PORT..."
+          SSH_PORT="${{ inputs.ssh_port }}" > /dev/null 2>&1
+          echo "Waiting for SSH to become available..."
           
-          IP="${{ steps.droplet-ip.outputs.ip }}"
+          IP="${{ steps.droplet-ip.outputs.ip }}" > /dev/null 2>&1
           MAX_ATTEMPTS=60
           ATTEMPT=0
           
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$IP/$SSH_PORT" 2>/dev/null; then
-              echo "✓ SSH port $SSH_PORT is available"
+              echo "✓ SSH is available"
               break
             fi
             
@@ -269,22 +277,23 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          # Add to known_hosts
+          # Add to known_hosts (suppress output to prevent IP/port exposure)
           ssh-keyscan -p ${{ inputs.ssh_port }} -H ${{ steps.droplet-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Wait for cloud-init to complete
         run: |
-          IP="${{ steps.droplet-ip.outputs.ip }}"
-          ADMIN_USER="${{ inputs.ssh_authorized_username }}"
+          IP="${{ steps.droplet-ip.outputs.ip }}" > /dev/null 2>&1
+          ADMIN_USER="${{ inputs.ssh_authorized_username }}" > /dev/null 2>&1
           
           echo "Waiting for cloud-init to complete..."
-          echo "Using admin user: $ADMIN_USER"
+          echo "Using configured admin user"
           
           # Use cloud-init status --wait to wait for completion (with timeout)
           # This ensures all packages are installed AND all runcmd scripts have executed
           ssh -p ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=5 \
             -o ServerAliveCountMax=3 \
@@ -295,6 +304,7 @@ jobs:
               ssh -p ${{ inputs.ssh_port }} \
                 -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
+                -o LogLevel=ERROR \
                 ${ADMIN_USER}@$IP \
                 "sudo cloud-init status --long" || true
               exit 1
@@ -307,6 +317,7 @@ jobs:
           ssh -p ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${ADMIN_USER}@$IP \
             "sudo test -f /etc/nginx/nginx.conf && sudo nginx -t" || {
               echo "Error: Nginx configuration is missing or invalid"
@@ -318,11 +329,12 @@ jobs:
       - name: Copy setup script to droplet
         run: |
           echo "Copying setup-application.sh to droplet..."
-          ADMIN_USER="${{ inputs.ssh_authorized_username }}"
+          ADMIN_USER="${{ inputs.ssh_authorized_username }}" > /dev/null 2>&1
           
           scp -P ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             infra/scripts/setup-application.sh \
             ${ADMIN_USER}@${{ steps.droplet-ip.outputs.ip }}:/tmp/setup-application.sh
           
@@ -332,12 +344,13 @@ jobs:
         id: setup-app
         run: |
           echo "Running application setup..."
-          ADMIN_USER="${{ inputs.ssh_authorized_username }}"
+          ADMIN_USER="${{ inputs.ssh_authorized_username }}" > /dev/null 2>&1
           
           # Make script executable and run it with sudo
           ssh -p ${{ inputs.ssh_port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${ADMIN_USER}@${{ steps.droplet-ip.outputs.ip }} \
             "chmod +x /tmp/setup-application.sh && \
              sudo /tmp/setup-application.sh \
@@ -346,61 +359,77 @@ jobs:
                '${{ inputs.metrics_path }}' \
                '${{ secrets.SSH_PUBLIC_KEY }}'"
           
-          # Generate username for summary
-          USERNAME=$(echo "${{ inputs.domain_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-32)
+          # Generate username using the same logic as sanitize_domain() function
+          DOMAIN="${{ inputs.domain_name }}"
+          USERNAME=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+          
+          # Truncate to 32 characters max (Linux username limit)
+          if [ ${#USERNAME} -gt 32 ]; then
+            USERNAME=$(echo "$USERNAME" | cut -c1-32)
+          fi
           echo "username=$USERNAME" >> $GITHUB_OUTPUT
           echo "✓ Application setup completed"
       
 
       
-      - name: Save metadata to repository
+      - name: Save metadata to GitHub Variable
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          echo "Saving deployment metadata..."
+          echo "Saving deployment metadata to GitHub Variable..."
           
-          USERNAME=$(echo "${{ inputs.domain_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-32)
+          # Source the helper functions
+          source /tmp/metadata-helpers.sh
           
-          mkdir -p .github/deployments
+          # Use the same username that was generated in the setup-app step
+          USERNAME="${{ steps.setup-app.outputs.username }}"
           
-          cat > .github/deployments/metadata.json << EOF
-          {
-            "droplet": {
-              "id": "${{ steps.create-droplet.outputs.droplet_id }}",
-              "name": "${{ steps.droplet-name.outputs.name }}",
-              "ip": "${{ steps.droplet-ip.outputs.ip }}",
-              "region": "${{ inputs.region }}",
-              "size": "${{ env.DROPLET_SIZE }}",
-              "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "ssh_port": ${{ inputs.ssh_port }},
-              "ssh_user": "${{ inputs.ssh_authorized_username }}"
-            },
-            "applications": [
-              {
-                "domain": "${{ inputs.domain_name }}",
-                "username": "$USERNAME",
-                "port": ${{ inputs.app_port }},
-                "metrics_path": "${{ inputs.metrics_path }}",
-                "service_name": "app-$USERNAME"
-              }
-            ]
-          }
-          EOF
+          # Create metadata JSON using jq to ensure proper formatting and escaping
+          METADATA=$(jq -n \
+            --arg droplet_id "${{ steps.create-droplet.outputs.droplet_id }}" \
+            --arg droplet_name "${{ steps.droplet-name.outputs.name }}" \
+            --arg droplet_ip "${{ steps.droplet-ip.outputs.ip }}" \
+            --arg region "${{ inputs.region }}" \
+            --arg size "${{ env.DROPLET_SIZE }}" \
+            --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson ssh_port "${{ inputs.ssh_port }}" \
+            --arg ssh_user "${{ inputs.ssh_authorized_username }}" \
+            --arg domain "${{ inputs.domain_name }}" \
+            --arg username "$USERNAME" \
+            --argjson app_port "${{ inputs.app_port }}" \
+            --arg metrics_path "${{ inputs.metrics_path }}" \
+            --arg service_name "app-$USERNAME" \
+            '{
+              "droplet": {
+                "id": $droplet_id,
+                "name": $droplet_name,
+                "ip": $droplet_ip,
+                "region": $region,
+                "size": $size,
+                "created_at": $created_at,
+                "ssh_port": $ssh_port,
+                "ssh_user": $ssh_user
+              },
+              "applications": [
+                {
+                  "domain": $domain,
+                  "username": $username,
+                  "port": $app_port,
+                  "metrics_path": $metrics_path,
+                  "service_name": $service_name
+                }
+              ]
+            }')
           
-          echo "✓ Metadata saved to .github/deployments/metadata.json"
-      
-      - name: Commit metadata
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
           
-          # Force add since metadata.json is in .gitignore
-          git add -f .github/deployments/metadata.json
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
+          # Update metadata using helper function (suppress output to avoid logging sensitive data)
+          if update_metadata "$METADATA" > /dev/null 2>&1; then
+            echo "✓ Metadata saved to DEPLOYMENT_METADATA variable"
           else
-            git commit -m "Add deployment metadata for ${{ inputs.domain_name }}"
-            git push
-            echo "✓ Metadata committed to repository"
+            echo "Error: Failed to save metadata"
+            echo "Note: Detailed error information is suppressed to protect sensitive data"
+            exit 1
           fi
       
       - name: Deployment summary
@@ -409,28 +438,23 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Droplet Information" >> $GITHUB_STEP_SUMMARY
           echo "- **Droplet ID**: ${{ steps.create-droplet.outputs.droplet_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **IP Address**: \`${{ steps.droplet-ip.outputs.ip }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Region**: ${{ inputs.region }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Size**: ${{ env.DROPLET_SIZE }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Application Configuration" >> $GITHUB_STEP_SUMMARY
           echo "- **Domain**: ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Username**: ${{ steps.setup-app.outputs.username }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Port**: ${{ inputs.app_port }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Application Port**: ${{ inputs.app_port }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Metrics Path**: ${{ inputs.metrics_path }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Service Name**: app-${{ steps.setup-app.outputs.username }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### SSH Access" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔒 Deployment Details" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Admin access (for server administration):**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Sensitive deployment information (IP address, SSH port, usernames) is stored securely in GitHub Variables." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Application user access (limited, no sudo):**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p ${{ inputs.ssh_port }} ${{ steps.setup-app.outputs.username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "To access deployment details, use other workflows:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Setup SSL**: Automatically retrieves droplet IP from metadata" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy**: Automatically retrieves connection details from metadata" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note**: This approach protects your infrastructure from exposure in public repositories." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚠️ Important: Configure DNS Records" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -438,48 +462,22 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Add these DNS records with your domain registrar:**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Type | Name | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| A | ${{ inputs.domain_name }} | ${{ steps.droplet-ip.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| A | www.${{ inputs.domain_name }} | ${{ steps.droplet-ip.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
+          echo "1. Add an **A record** for \`${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add an **A record** for \`www.${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: DNS propagation typically takes 5-10 minutes, but can take up to 48 hours." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "1. **Configure DNS records** (see table above)" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Configure DNS records** (see instructions above)" >> $GITHUB_STEP_SUMMARY
           echo "2. **Wait for DNS propagation** - Verify with:" >> $GITHUB_STEP_SUMMARY
           echo '   ```bash' >> $GITHUB_STEP_SUMMARY
           echo "   dig +short ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
           echo '   ```' >> $GITHUB_STEP_SUMMARY
-          echo "3. **Setup SSL certificate** - Choose one option:" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "   **Option A: Run setup-ssl workflow (recommended)**" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Setup SSL certificate** - Run the setup-ssl workflow:" >> $GITHUB_STEP_SUMMARY
           echo "   - Go to Actions → Setup SSL" >> $GITHUB_STEP_SUMMARY
           echo "   - Enter domain: \`${{ inputs.domain_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "   - Enter droplet IP: \`${{ steps.droplet-ip.outputs.ip }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "   **Option B: Run manually via SSH**" >> $GITHUB_STEP_SUMMARY
-          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
-          echo "   # Note: Password authentication is disabled, use SSH key" >> $GITHUB_STEP_SUMMARY
-          echo "   ssh -p ${{ inputs.ssh_port }} -i /path/to/your/private_key ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
-          echo "   sudo ./infra/scripts/setup-ssl.sh ${{ inputs.domain_name }} ${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
-          echo '   ```' >> $GITHUB_STEP_SUMMARY
+          echo "   - Leave droplet IP empty (will be retrieved from metadata automatically)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "4. **Deploy your application** - Create a release tag (e.g., v1.0.0)" >> $GITHUB_STEP_SUMMARY
           echo "5. **Access your application** at: https://${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Temporary HTTP Access" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Your application is currently accessible via HTTP (without SSL):" >> $GITHUB_STEP_SUMMARY
-          echo "- http://${{ steps.droplet-ip.outputs.ip }}:80" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> **Warning**: This is for testing only. Run the setup-ssl workflow to enable HTTPS." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Monitoring" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Access Prometheus metrics via SSH tunnel:" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p ${{ inputs.ssh_port }} -L 9090:localhost:9090 ${{ inputs.ssh_authorized_username }}@${{ steps.droplet-ip.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
-          echo "# Then open http://localhost:9090 in your browser" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY

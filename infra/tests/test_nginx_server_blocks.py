@@ -44,13 +44,27 @@ def sanitize_domain_to_username(domain: str) -> str:
     Returns:
         Sanitized username
     """
+    import hashlib
+    
     # Convert to lowercase
     sanitized = domain.lower()
     
     # Remove all non-alphanumeric characters
     sanitized = re.sub(r'[^a-z0-9]', '', sanitized)
     
-    # Truncate to 32 characters
+    # If the sanitized result would be too long or empty, use hash-based approach
+    if len(sanitized) > 26 or len(sanitized) == 0:
+        # Use first 26 chars + 6-char hash for uniqueness
+        hash_suffix = hashlib.md5(domain.encode()).hexdigest()[:6]
+        sanitized = sanitized[:26] + hash_suffix
+    elif len(sanitized) < 32:
+        # For shorter names, add hash suffix to ensure uniqueness
+        # This prevents collisions like '0aaaaa' from both '0.aaaaa' and '0a.aaaa'
+        hash_suffix = hashlib.md5(domain.encode()).hexdigest()[:6]
+        max_base_len = 32 - 6  # Reserve 6 chars for hash
+        sanitized = sanitized[:max_base_len] + hash_suffix
+    
+    # Ensure we don't exceed 32 characters
     sanitized = sanitized[:32]
     
     return sanitized
