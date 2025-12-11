@@ -26,11 +26,19 @@ jobs:
     name: Add Application to Existing Droplet
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Allow pushing metadata.json to repository
+      contents: read   # Required for reading repository content
+      actions: write   # Required for managing GitHub Actions Variables
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      
+      - name: Setup metadata helpers
+        run: |
+          # Copy metadata helper functions to a temporary location
+          cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
+          chmod +x /tmp/metadata-helpers.sh
+          echo "✓ Metadata helper functions loaded"
       
       - name: Validate inputs
         run: |
@@ -59,21 +67,27 @@ jobs:
       
       - name: Check for port conflicts
         id: port-check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          source /tmp/metadata-helpers.sh
+          
           echo "Checking for port conflicts..."
           
-          METADATA_FILE=".github/deployments/metadata.json"
           NEW_PORT="${{ inputs.app_port }}"
           
-          # Check if metadata file exists
-          if [ ! -f "$METADATA_FILE" ]; then
-            echo "Error: Metadata file not found at $METADATA_FILE"
+          # Get metadata from GitHub Variable (suppress output to avoid logging sensitive data)
+          METADATA=$(get_metadata)
+          
+          # Check if metadata exists
+          if [ "$METADATA" = "{}" ]; then
+            echo "Error: No deployment metadata found"
             echo "Please ensure you have created a droplet first using the create-droplet workflow"
             exit 1
           fi
           
           # Extract existing ports from metadata
-          EXISTING_PORTS=$(jq -r '.applications[].port' "$METADATA_FILE")
+          EXISTING_PORTS=$(echo "$METADATA" | jq -r '.applications[].port')
           
           # Check if new port conflicts with existing ports
           for PORT in $EXISTING_PORTS; do
@@ -81,7 +95,7 @@ jobs:
               echo "Error: Port $NEW_PORT is already in use by another application"
               echo ""
               echo "Existing applications and their ports:"
-              jq -r '.applications[] | "  - \(.domain): port \(.port)"' "$METADATA_FILE"
+              echo "$METADATA" | jq -r '.applications[] | "  - \(.domain): port \(.port)"'
               echo ""
               echo "Please choose a different port for your new application"
               exit 1
@@ -93,13 +107,16 @@ jobs:
       
       - name: Load SSH port from metadata
         id: ssh-config
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          echo "Loading SSH port from metadata..."
+          source /tmp/metadata-helpers.sh
           
-          METADATA_FILE=".github/deployments/metadata.json"
-          SSH_PORT=$(jq -r '.droplet.ssh_port // 53222' "$METADATA_FILE")
+          echo "Loading SSH port from metadata..." > /dev/null 2>&1
           
-          echo "SSH port: $SSH_PORT"
+          SSH_PORT=$(get_ssh_port) > /dev/null 2>&1
+          
+          echo "✓ SSH port loaded successfully"
           echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
       
       - name: Setup SSH key for connection
@@ -108,7 +125,7 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          # Add to known_hosts
+          # Add to known_hosts (suppress output to prevent IP/port exposure)
           ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ inputs.droplet_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Add admin_username input parameter
@@ -122,11 +139,12 @@ jobs:
           echo "Copying setup-application.sh to droplet..."
           
           # Use 'admin' as default admin username (can be overridden via workflow_dispatch input if needed)
-          ADMIN_USER="admin"
+          ADMIN_USER="admin" > /dev/null 2>&1
           
           scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             infra/scripts/setup-application.sh \
             ${ADMIN_USER}@${{ inputs.droplet_ip }}:/tmp/setup-application.sh
           
@@ -137,12 +155,13 @@ jobs:
         run: |
           echo "Running application setup for new domain..."
           
-          ADMIN_USER="admin"
+          ADMIN_USER="admin" > /dev/null 2>&1
           
           # Make script executable and run it with sudo
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${ADMIN_USER}@${{ inputs.droplet_ip }} \
             "chmod +x /tmp/setup-application.sh && \
              sudo /tmp/setup-application.sh \
@@ -152,92 +171,112 @@ jobs:
                '${{ secrets.SSH_PUBLIC_KEY }}' && \
              rm /tmp/setup-application.sh"
           
-          # Generate username for metadata
-          USERNAME=$(echo "${{ inputs.domain_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-32)
+          # Generate username using the same logic as sanitize_domain() function
+          DOMAIN="${{ inputs.domain_name }}"
+          USERNAME=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+          
+          # Truncate to 32 characters max (Linux username limit)
+          if [ ${#USERNAME} -gt 32 ]; then
+            USERNAME=$(echo "$USERNAME" | cut -c1-32)
+          fi
           echo "username=$USERNAME" >> $GITHUB_OUTPUT
           echo "✓ Application setup completed"
       
       - name: Update metadata with new application
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          source /tmp/metadata-helpers.sh
+          
           echo "Updating deployment metadata..."
           
-          METADATA_FILE=".github/deployments/metadata.json"
+          # Read existing metadata (suppress output to avoid logging sensitive data)
+          EXISTING_METADATA=$(get_metadata)
           
-          # Read existing metadata
-          EXISTING_METADATA=$(cat "$METADATA_FILE")
-          
-          # Create new application entry
-          NEW_APP=$(cat << EOF
-          {
-            "domain": "${{ inputs.domain_name }}",
-            "username": "${{ steps.setup-app.outputs.username }}",
-            "port": ${{ inputs.app_port }},
-            "metrics_path": "${{ inputs.metrics_path }}",
-            "service_name": "app-${{ steps.setup-app.outputs.username }}"
-          }
-          EOF
-          )
+          # Create new application entry using jq for proper JSON formatting
+          NEW_APP=$(jq -n \
+            --arg domain "${{ inputs.domain_name }}" \
+            --arg username "${{ steps.setup-app.outputs.username }}" \
+            --argjson port "${{ inputs.app_port }}" \
+            --arg metrics_path "${{ inputs.metrics_path }}" \
+            --arg service_name "app-${{ steps.setup-app.outputs.username }}" \
+            '{
+              "domain": $domain,
+              "username": $username,
+              "port": $port,
+              "metrics_path": $metrics_path,
+              "service_name": $service_name
+            }')
           
           # Append new application to the applications array
-          UPDATED_METADATA=$(echo "$EXISTING_METADATA" | jq ".applications += [$NEW_APP]")
+          UPDATED_METADATA=$(echo "$EXISTING_METADATA" | jq --argjson new_app "$NEW_APP" '.applications += [$new_app]')
           
-          # Write updated metadata back to file
-          echo "$UPDATED_METADATA" > "$METADATA_FILE"
+          # Update metadata in GitHub Variable (suppress output to avoid logging sensitive data)
+          if update_metadata "$UPDATED_METADATA" > /dev/null 2>&1; then
+            echo "✓ Metadata updated successfully"
+          else
+            echo "Error: Failed to update metadata"
+            echo "Note: Detailed error information is suppressed to protect sensitive data"
+            exit 1
+          fi
           
-          echo "✓ Metadata updated successfully"
-          
-          # Display updated applications list
+          # Display updated applications list (domains and ports only, no sensitive info)
           echo ""
           echo "Current applications on this droplet:"
-          jq -r '.applications[] | "  - \(.domain) (port \(.port))"' "$METADATA_FILE"
-      
-      - name: Commit metadata changes
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add .github/deployments/metadata.json
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Add application ${{ inputs.domain_name }} to droplet"
-            git push
-            echo "✓ Metadata committed to repository"
-          fi
+          echo "$UPDATED_METADATA" | jq -r '.applications[] | "  - \(.domain) (port \(.port))"'
       
       - name: Deployment summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           echo "## 🎉 Application Added Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### New Application Configuration" >> $GITHUB_STEP_SUMMARY
           echo "- **Domain**: ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Username**: ${{ steps.setup-app.outputs.username }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Username**: Configured securely (stored in metadata)" >> $GITHUB_STEP_SUMMARY
           echo "- **Port**: ${{ inputs.app_port }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Metrics Path**: ${{ inputs.metrics_path }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Service Name**: app-${{ steps.setup-app.outputs.username }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service Name**: Configured securely (stored in metadata)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### SSH Access" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔒 Connection Details" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Admin access (for server administration):**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p ${{ steps.ssh-config.outputs.port }} admin@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Sensitive connection information (IP address, SSH port, usernames) is stored securely in GitHub Variables." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Application user access (can deploy and restart own service):**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p ${{ steps.ssh-config.outputs.port }} ${{ steps.setup-app.outputs.username }}@${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "To access your application:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy workflow**: Automatically retrieves connection details from metadata" >> $GITHUB_STEP_SUMMARY
+          echo "- **SSH access**: Connection details are available to authorized team members via metadata" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note**: This approach protects your infrastructure from exposure in public repositories." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚠️ Important: Configure DNS Records" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Your application is configured, but you need to set up DNS records manually:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Add these DNS records with your domain registrar:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Add an **A record** for \`${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add an **A record** for \`www.${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note**: DNS propagation typically takes 5-10 minutes, but can take up to 48 hours." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "1. ✅ Configure DNS records for ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "   - A record: ${{ inputs.domain_name }} → ${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
-          echo "   - A record: www.${{ inputs.domain_name }} → ${{ inputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
-          echo "2. ✅ Wait for DNS propagation (5-10 minutes)" >> $GITHUB_STEP_SUMMARY
-          echo "3. ✅ Deploy your application using a release tag" >> $GITHUB_STEP_SUMMARY
-          echo "4. ✅ Access your application at: https://${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Configure DNS records** (see instructions above)" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Wait for DNS propagation** - Verify with:" >> $GITHUB_STEP_SUMMARY
+          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
+          echo "   dig +short ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
+          echo '   ```' >> $GITHUB_STEP_SUMMARY
+          echo "3. **Setup SSL certificate** - Run the setup-ssl workflow:" >> $GITHUB_STEP_SUMMARY
+          echo "   - Go to Actions → Setup SSL" >> $GITHUB_STEP_SUMMARY
+          echo "   - Enter domain: \`${{ inputs.domain_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "   - Leave droplet IP empty (will be retrieved from metadata automatically)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Deploy your application** - Create a release tag (e.g., v1.0.0)" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Access your application** at: https://${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### All Applications on This Droplet" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          jq -r '.applications[] | "- \(.domain): port \(.port), service: \(.service_name)"' .github/deployments/metadata.json >> $GITHUB_STEP_SUMMARY
+          source /tmp/metadata-helpers.sh
+          METADATA=$(get_metadata)
+          echo "$METADATA" | jq -r '.applications[] | "- \(.domain): port \(.port), service: \(.service_name)"' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

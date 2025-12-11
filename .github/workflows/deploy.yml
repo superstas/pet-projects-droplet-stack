@@ -22,13 +22,23 @@ jobs:
 
     name: Deploy Application to Droplet
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # Required for reading repository content
+      actions: read   # Required for reading GitHub Actions Variables
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}  # Ensure we get the latest commit with metadata
+          ref: ${{ github.ref }}
+      
+      - name: Setup metadata helpers
+        run: |
+          # Copy metadata helper functions to a temporary location
+          cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
+          chmod +x /tmp/metadata-helpers.sh
+          echo "✓ Metadata helper functions ready"
       
       - name: Extract tag name
         id: tag
@@ -46,15 +56,16 @@ jobs:
       
       - name: Load deployment metadata
         id: metadata
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # Pull latest changes to ensure we have metadata.json
-          git pull origin ${{ github.ref_name }} || true
+          source /tmp/metadata-helpers.sh
           
-          METADATA_FILE=".github/deployments/metadata.json"
+          METADATA=$(get_metadata > /dev/null 2>&1 && get_metadata)
           
-          if [ ! -f "$METADATA_FILE" ]; then
-            echo "Error: Metadata file not found at $METADATA_FILE"
-            echo "Please ensure you have created a droplet first using the create-droplet workflow"
+          if [ "$METADATA" = "{}" ]; then
+            echo "Error: No deployment metadata found"
+            echo "Please create a droplet first using the create-droplet workflow"
             exit 1
           fi
           
@@ -63,21 +74,21 @@ jobs:
             APP_DOMAIN="${{ inputs.domain_name }}"
           else
             # For tag push or empty input, deploy the first application
-            APP_DOMAIN=$(jq -r '.applications[0].domain' "$METADATA_FILE")
+            APP_DOMAIN=$(echo "$METADATA" | jq -r '.applications[0].domain')
           fi
           
           echo "Deploying application: $APP_DOMAIN"
           
           # Extract application details
-          APP_USERNAME=$(jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .username" "$METADATA_FILE")
-          APP_SERVICE=$(jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .service_name" "$METADATA_FILE")
-          DROPLET_IP=$(jq -r '.droplet.ip' "$METADATA_FILE")
+          APP_USERNAME=$(echo "$METADATA" | jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .username")
+          APP_SERVICE=$(echo "$METADATA" | jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .service_name")
+          DROPLET_IP=$(echo "$METADATA" | jq -r '.droplet.ip')
           
           if [ -z "$APP_USERNAME" ] || [ "$APP_USERNAME" = "null" ]; then
             echo "Error: Application $APP_DOMAIN not found in metadata"
             echo ""
             echo "Available applications:"
-            jq -r '.applications[] | "  - \(.domain)"' "$METADATA_FILE"
+            echo "$METADATA" | jq -r '.applications[] | "  - \(.domain)"'
             exit 1
           fi
           
@@ -86,18 +97,18 @@ jobs:
           echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
           echo "domain=$APP_DOMAIN" >> $GITHUB_OUTPUT
           
-          echo "✓ Loaded metadata:"
-          echo "  - Username: $APP_USERNAME"
-          echo "  - Service: $APP_SERVICE"
-          echo "  - Droplet IP: $DROPLET_IP"
+          echo "✓ Loaded metadata successfully"
       
       - name: Load SSH port from metadata
         id: ssh-config
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          METADATA_FILE=".github/deployments/metadata.json"
-          SSH_PORT=$(jq -r '.droplet.ssh_port // 53222' "$METADATA_FILE")
+          source /tmp/metadata-helpers.sh
+          
+          SSH_PORT=$(get_ssh_port > /dev/null 2>&1 && get_ssh_port) > /dev/null 2>&1
           echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
-          echo "✓ SSH port configured: $SSH_PORT"
+          echo "✓ SSH port configured successfully"
       
       - name: Setup SSH key for connection
         run: |
@@ -105,7 +116,7 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          # Add to known_hosts
+          # Add to known_hosts (suppress output to prevent IP/port exposure)
           ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ steps.metadata.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Create release directory on droplet
@@ -115,10 +126,11 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "mkdir -p ~/releases/${{ steps.tag.outputs.tag }}/app"
           
-          echo "✓ Release directory created: /home/${{ steps.metadata.outputs.username }}/releases/${{ steps.tag.outputs.tag }}/app"
+          echo "✓ Release directory created successfully"
       
       - name: Deploy application files
         run: |
@@ -139,6 +151,7 @@ jobs:
           scp -P ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             /tmp/app.tar.gz \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
           echo "✓ Transferred archive to remote server"
@@ -147,6 +160,7 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
           echo "✓ Extracted archive on remote server"
@@ -164,6 +178,7 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "chmod +x ~/releases/${{ steps.tag.outputs.tag }}/app/start.sh"
           
@@ -176,6 +191,7 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "ln -sfn ~/releases/${{ steps.tag.outputs.tag }}/app ~/app"
           
@@ -188,6 +204,7 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "sudo systemctl restart ${{ steps.metadata.outputs.service }}"
           
@@ -203,6 +220,7 @@ jobs:
           SERVICE_STATUS=$(ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "sudo systemctl is-active ${{ steps.metadata.outputs.service }}")
           
@@ -215,6 +233,7 @@ jobs:
             ssh -p ${{ steps.ssh-config.outputs.port }} \
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
+              -o LogLevel=ERROR \
               ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
               "sudo journalctl -u ${{ steps.metadata.outputs.service }} -n 50 --no-pager"
             
@@ -260,6 +279,7 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             'cd ~/releases && ls -t | tail -n +4 | xargs -r rm -rf'
           
@@ -271,6 +291,7 @@ jobs:
           ssh -p ${{ steps.ssh-config.outputs.port }} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
             ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
             "ls -1 ~/releases"
       
@@ -282,20 +303,22 @@ jobs:
           echo "### Deployment Information" >> $GITHUB_STEP_SUMMARY
           echo "- **Version**: ${{ steps.tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Application**: ${{ steps.metadata.outputs.domain }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Username**: ${{ steps.metadata.outputs.username }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Service**: ${{ steps.metadata.outputs.service }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Droplet IP**: ${{ steps.metadata.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Access Your Application" >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: https://${{ steps.metadata.outputs.domain }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Connection Details" >> $GITHUB_STEP_SUMMARY
+          echo "Connection details (IP address, SSH port, username) are securely stored in GitHub Variables." >> $GITHUB_STEP_SUMMARY
+          echo "Access them via Settings → Secrets and variables → Actions → Variables → DEPLOYMENT_METADATA" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Rollback Instructions" >> $GITHUB_STEP_SUMMARY
           echo "If you need to rollback to a previous version:" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "ssh -p ${{ steps.ssh-config.outputs.port }} ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "# Connect to your droplet using stored credentials" >> $GITHUB_STEP_SUMMARY
           echo "ls -1 ~/releases/  # List available versions" >> $GITHUB_STEP_SUMMARY
           echo "ln -sfn ~/releases/v1.0.0/app ~/app  # Switch to desired version" >> $GITHUB_STEP_SUMMARY
-          echo "sudo systemctl restart ${{ steps.metadata.outputs.service }}" >> $GITHUB_STEP_SUMMARY
+          echo "sudo systemctl restart <service-name>" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
   
   create-release:

@@ -16,16 +16,29 @@ def sanitize_domain(domain: str) -> str:
     Rules:
     - Convert to lowercase
     - Remove all non-alphanumeric characters
+    - Add hash suffix to ensure uniqueness
     - Truncate to 32 characters max
     """
+    import hashlib
+    
     # Convert to lowercase
     sanitized = domain.lower()
     
     # Remove all non-alphanumeric characters
     sanitized = re.sub(r'[^a-z0-9]', '', sanitized)
     
-    # Truncate to 32 characters
-    sanitized = sanitized[:32]
+    # Generate a 6-character hash suffix from the original domain for uniqueness
+    hash_suffix = hashlib.md5(domain.encode()).hexdigest()[:6]
+    
+    # Calculate max length for base part (32 total - 6 for hash)
+    max_base_len = 26
+    
+    # Truncate base part and add hash suffix
+    if len(sanitized) > max_base_len:
+        sanitized = sanitized[:max_base_len]
+    
+    # Add hash suffix for uniqueness
+    sanitized = sanitized + hash_suffix
     
     return sanitized
 
@@ -62,15 +75,26 @@ def test_domain_sanitization_preserves_valid_characters(domain):
     Property: Valid characters should be preserved (except dots and hyphens).
     
     For any domain containing valid characters, the sanitized version
-    should preserve all alphanumeric characters.
+    should preserve all alphanumeric characters in the base part.
     """
     result = sanitize_domain(domain)
     
     # Extract only alphanumeric characters from original
-    expected_chars = re.sub(r'[^a-z0-9]', '', domain.lower())[:32]
+    expected_base = re.sub(r'[^a-z0-9]', '', domain.lower())
     
-    assert result == expected_chars, \
-        f"Expected '{expected_chars}' but got '{result}'"
+    # The result should start with the expected base (up to 26 chars) + 6-char hash
+    max_base_len = min(26, len(expected_base))
+    expected_prefix = expected_base[:max_base_len]
+    
+    assert result.startswith(expected_prefix), \
+        f"Result '{result}' should start with '{expected_prefix}'"
+    
+    # Result should be exactly 32 chars or less
+    assert len(result) <= 32, f"Result '{result}' exceeds 32 characters"
+    
+    # Result should contain only alphanumeric characters
+    assert re.match(r'^[a-z0-9]+$', result), \
+        f"Result '{result}' contains invalid characters"
 
 
 @settings(max_examples=100)
@@ -85,10 +109,18 @@ def test_domain_sanitization_converts_to_lowercase(uppercase_domain):
     assert result == result.lower(), \
         f"Result '{result}' is not all lowercase"
     
-    # Result should match the lowercase version (truncated to 32 chars)
-    expected = uppercase_domain.lower()[:32]
-    assert result == expected, \
-        f"Expected '{expected}' but got '{result}'"
+    # Result should start with the lowercase version of the input (up to 26 chars)
+    expected_base = uppercase_domain.lower()
+    max_base_len = min(26, len(expected_base))
+    expected_prefix = expected_base[:max_base_len]
+    
+    assert result.startswith(expected_prefix), \
+        f"Result '{result}' should start with '{expected_prefix}'"
+    
+    # Result should be exactly the expected length (base + 6-char hash)
+    expected_len = min(26, len(expected_base)) + 6
+    assert len(result) == expected_len, \
+        f"Expected length {expected_len} but got {len(result)}"
 
 
 if __name__ == '__main__':

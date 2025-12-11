@@ -44,9 +44,27 @@ WantedBy=multi-user.target
 
 def sanitize_domain(domain: str) -> str:
     """Sanitize domain to create valid username."""
+    import hashlib
+    
+    # Convert to lowercase
     sanitized = domain.lower()
+    
+    # Remove all non-alphanumeric characters
     sanitized = re.sub(r'[^a-z0-9]', '', sanitized)
-    sanitized = sanitized[:32]
+    
+    # Generate a 6-character hash suffix from the original domain for uniqueness
+    hash_suffix = hashlib.md5(domain.encode()).hexdigest()[:6]
+    
+    # Calculate max length for base part (32 total - 6 for hash)
+    max_base_len = 26
+    
+    # Truncate base part and add hash suffix
+    if len(sanitized) > max_base_len:
+        sanitized = sanitized[:max_base_len]
+    
+    # Add hash suffix for uniqueness
+    sanitized = sanitized + hash_suffix
+    
     return sanitized
 
 

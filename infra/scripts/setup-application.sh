@@ -38,6 +38,7 @@ log_error() {
 # - Convert to lowercase
 # - Remove all non-alphanumeric characters
 # - Truncate to 32 characters max
+# - Domain name is already unique, no hash suffix needed
 sanitize_domain() {
     local domain="$1"
     local sanitized
@@ -48,8 +49,10 @@ sanitize_domain() {
     # Remove all non-alphanumeric characters
     sanitized=$(echo "$sanitized" | sed 's/[^a-z0-9]//g')
     
-    # Truncate to 32 characters
-    sanitized=$(echo "$sanitized" | cut -c1-32)
+    # Truncate to 32 characters max (Linux username limit)
+    if [ ${#sanitized} -gt 32 ]; then
+        sanitized=$(echo "$sanitized" | cut -c1-32)
+    fi
     
     echo "$sanitized"
 }
