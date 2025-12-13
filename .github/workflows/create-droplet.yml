@@ -123,6 +123,7 @@ jobs:
           # Check port range (1024-65535)
           if [ "$SSH_PORT" -lt 1024 ] || [ "$SSH_PORT" -gt 65535 ]; then
             echo "Error: SSH port must be between 1024 and 65535"
+            echo "Ports below 1024 are system ports (like 22, 80, 443) and are reserved"
             echo "Please provide a valid port number in the allowed range"
             exit 1
           fi

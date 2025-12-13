@@ -199,8 +199,8 @@ setup() {
     assert_success
 }
 
-@test "add-application.yml has required input: droplet_ip" {
-    run grep -q "droplet_ip:" "$PROJECT_ROOT/.github/workflows/add-application.yml"
+@test "add-application.yml retrieves droplet_ip from metadata" {
+    run grep -q "get_droplet_ip" "$PROJECT_ROOT/.github/workflows/add-application.yml"
     assert_success
 }
 
