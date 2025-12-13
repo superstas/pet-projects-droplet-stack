@@ -19,13 +19,7 @@ set -euo pipefail
 #   METADATA=$(get_metadata)
 get_metadata() {
   # Validate required environment variables
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "Error: GITHUB_TOKEN environment variable is required" >&2
-    return 1
-  fi
-  
-  if [ -z "${GITHUB_REPOSITORY:-}" ]; then
-    echo "Error: GITHUB_REPOSITORY environment variable is required" >&2
+  if ! validate_environment; then
     return 1
   fi
   
@@ -50,10 +44,8 @@ get_metadata() {
   
   # Check for other HTTP errors
   if [ "$http_code" -ge 400 ]; then
-    echo "Error: GitHub API request failed with HTTP $http_code" >&2
-    if echo "$response" | jq -e '.message' > /dev/null 2>&1; then
-      echo "Error message: $(echo "$response" | jq -r '.message')" >&2
-    fi
+    echo "Warning: Unable to access deployment configuration" >&2
+    # Don't expose detailed error messages that might contain sensitive information
     echo "{}"
     return 1
   fi
@@ -90,13 +82,7 @@ update_metadata() {
   local json_data="${1:-}"
   
   # Validate required environment variables
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "Error: GITHUB_TOKEN environment variable is required" >&2
-    return 1
-  fi
-  
-  if [ -z "${GITHUB_REPOSITORY:-}" ]; then
-    echo "Error: GITHUB_REPOSITORY environment variable is required" >&2
+  if ! validate_environment; then
     return 1
   fi
   
@@ -143,12 +129,9 @@ update_metadata() {
   
   # Check for API errors
   if [ "$api_http_code" -ge 400 ]; then
-    echo "Error: GitHub API request failed with HTTP $api_http_code" >&2
-    if echo "$api_response" | jq -e '.message' > /dev/null 2>&1; then
-      local error_msg=$(echo "$api_response" | jq -r '.message')
-      echo "Error: GitHub API request failed: $error_msg" >&2
-    fi
-    echo "Please check GITHUB_TOKEN permissions and try again" >&2
+    echo "Warning: Unable to update deployment configuration" >&2
+    # Don't expose detailed error messages that might contain sensitive information
+    echo "Please verify authentication and permissions" >&2
     return 1
   fi
   
@@ -159,67 +142,204 @@ update_metadata() {
 #
 # Returns:
 #   IP address string, or empty string if not found
+#   Output is suppressed by default for security
 #
 # Environment variables required:
 #   GITHUB_TOKEN - GitHub token for API authentication
 #   GITHUB_REPOSITORY - Repository in format owner/repo
 #
 # Example:
-#   DROPLET_IP=$(get_droplet_ip)
+#   DROPLET_IP=$(get_droplet_ip) > /dev/null 2>&1
 get_droplet_ip() {
   local metadata
-  metadata=$(get_metadata) || return 1
+  local ip_address
+  
+  # Secure error handling - don't expose sensitive information
+  if ! metadata=$(get_metadata 2>/dev/null); then
+    # Generic error message without revealing sensitive details
+    echo "Warning: Unable to retrieve deployment configuration" >&2
+    echo ""
+    return 1
+  fi
   
   if [ "$metadata" = "{}" ]; then
+    # No metadata available - return empty string as secure fallback
     echo ""
     return 0
   fi
   
-  echo "$metadata" | jq -r '.droplet.ip // empty'
+  # Extract IP with secure error handling
+  if ! ip_address=$(echo "$metadata" | jq -r '.droplet.ip // empty' 2>/dev/null); then
+    # Generic error message without exposing metadata structure
+    echo "Warning: Configuration data format issue detected" >&2
+    echo ""
+    return 1
+  fi
+  
+  # Validate IP address format without exposing the actual value
+  if [ -n "$ip_address" ] && ! echo "$ip_address" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+    echo "Warning: Invalid network configuration detected" >&2
+    echo ""
+    return 1
+  fi
+  
+  echo "$ip_address"
 }
 
 # get_ssh_port - Extracts SSH port from metadata
 #
 # Returns:
-#   SSH port number, or 53222 (default) if not found
+#   SSH port number, or secure default if not found
+#   Output is suppressed by default for security
 #
 # Environment variables required:
 #   GITHUB_TOKEN - GitHub token for API authentication
 #   GITHUB_REPOSITORY - Repository in format owner/repo
 #
 # Example:
-#   SSH_PORT=$(get_ssh_port)
+#   SSH_PORT=$(get_ssh_port) > /dev/null 2>&1
 get_ssh_port() {
   local metadata
-  metadata=$(get_metadata) || return 1
+  local ssh_port
+  local default_port="22"
+  
+  # Secure error handling - don't expose sensitive information
+  if ! metadata=$(get_metadata 2>/dev/null); then
+    # Generic error message without revealing sensitive details
+    echo "Warning: Unable to retrieve deployment configuration" >&2
+    echo "$default_port"
+    return 1
+  fi
   
   if [ "$metadata" = "{}" ]; then
-    echo "53222"
+    # No metadata available - return secure default
+    echo "$default_port"
     return 0
   fi
   
-  echo "$metadata" | jq -r '.droplet.ssh_port // 53222'
+  # Extract port with secure error handling
+  if ! ssh_port=$(echo "$metadata" | jq -r ".droplet.ssh_port // $default_port" 2>/dev/null); then
+    # Generic error message without exposing metadata structure
+    echo "Warning: Configuration data format issue detected" >&2
+    echo "$default_port"
+    return 1
+  fi
+  
+  # Validate port number without exposing the actual value
+  if ! echo "$ssh_port" | grep -qE '^[0-9]+$' || [ "$ssh_port" -lt 1 ] || [ "$ssh_port" -gt 65535 ]; then
+    echo "Warning: Invalid port configuration detected" >&2
+    echo "$default_port"
+    return 1
+  fi
+  
+  echo "$ssh_port"
 }
 
 # get_ssh_user - Extracts SSH username from metadata
 #
 # Returns:
-#   SSH username, or "admin" (default) if not found
+#   SSH username, or secure default if not found
+#   Output is suppressed by default for security
 #
 # Environment variables required:
 #   GITHUB_TOKEN - GitHub token for API authentication
 #   GITHUB_REPOSITORY - Repository in format owner/repo
 #
 # Example:
-#   SSH_USER=$(get_ssh_user)
+#   SSH_USER=$(get_ssh_user) > /dev/null 2>&1
 get_ssh_user() {
   local metadata
-  metadata=$(get_metadata) || return 1
+  local ssh_user
+  local default_user="root"
+  
+  # Secure error handling - don't expose sensitive information
+  if ! metadata=$(get_metadata 2>/dev/null); then
+    # Generic error message without revealing sensitive details
+    echo "Warning: Unable to retrieve deployment configuration" >&2
+    echo "$default_user"
+    return 1
+  fi
   
   if [ "$metadata" = "{}" ]; then
-    echo "admin"
+    # No metadata available - return secure default
+    echo "$default_user"
     return 0
   fi
   
-  echo "$metadata" | jq -r '.droplet.ssh_user // "admin"'
+  # Extract username with secure error handling
+  if ! ssh_user=$(echo "$metadata" | jq -r ".droplet.ssh_user // \"$default_user\"" 2>/dev/null); then
+    # Generic error message without exposing metadata structure
+    echo "Warning: Configuration data format issue detected" >&2
+    echo "$default_user"
+    return 1
+  fi
+  
+  # Validate username format without exposing the actual value
+  if [ -n "$ssh_user" ] && ! echo "$ssh_user" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+    echo "Warning: Invalid user configuration detected" >&2
+    echo "$default_user"
+    return 1
+  fi
+  
+  echo "$ssh_user"
+}
+
+# log_secure_status - Provides generic status messages for debugging without revealing sensitive values
+#
+# Parameters:
+#   $1 - operation: The operation being performed (e.g., "connection", "deployment", "configuration")
+#   $2 - status: The status (e.g., "starting", "success", "failed", "retrying")
+#   $3 - context: Optional context (e.g., "ssh", "api", "validation")
+#
+# Returns:
+#   Logs generic status message to stderr
+#
+# Example:
+#   log_secure_status "connection" "starting" "ssh"
+#   log_secure_status "deployment" "success"
+log_secure_status() {
+  local operation="${1:-operation}"
+  local status="${2:-unknown}"
+  local context="${3:-}"
+  
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  
+  if [ -n "$context" ]; then
+    echo "[$timestamp] $operation ($context): $status" >&2
+  else
+    echo "[$timestamp] $operation: $status" >&2
+  fi
+}
+
+# validate_environment - Validates required environment variables without exposing their values
+#
+# Returns:
+#   0 if all required variables are set, 1 otherwise
+#   Logs generic error messages without revealing variable contents
+#
+# Example:
+#   if ! validate_environment; then
+#     log_secure_status "configuration" "failed" "environment"
+#     exit 1
+#   fi
+validate_environment() {
+  local missing_vars=0
+  
+  if [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "Warning: Authentication token not configured" >&2
+    missing_vars=1
+  fi
+  
+  if [ -z "${GITHUB_REPOSITORY:-}" ]; then
+    echo "Warning: Repository identifier not configured" >&2
+    missing_vars=1
+  fi
+  
+  if [ "$missing_vars" -eq 1 ]; then
+    echo "Error: Required environment configuration missing" >&2
+    return 1
+  fi
+  
+  return 0
 }

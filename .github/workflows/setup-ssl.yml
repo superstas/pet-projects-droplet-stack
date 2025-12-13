@@ -7,10 +7,6 @@ on:
         description: 'Domain name to configure SSL for (e.g., example.com)'
         required: true
         type: string
-      droplet_ip:
-        description: 'IP address of the droplet (optional - will read from metadata if not provided)'
-        required: false
-        type: string
 
 jobs:
   setup-ssl:
@@ -24,12 +20,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Setup metadata helpers
+      - name: Process and mask sensitive data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # Copy metadata helper functions to a temporary location
+          echo "Processing sensitive data..."
+          
+          # Copy metadata helper functions first
           cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
           chmod +x /tmp/metadata-helpers.sh
-          echo "✓ Metadata helper functions ready"
+          source /tmp/metadata-helpers.sh
+          
+          # Get all connection details from metadata
+          echo "Reading connection details from metadata..."
+          DROPLET_IP=$(get_droplet_ip 2>/dev/null)
+          SSH_PORT=$(get_ssh_port 2>/dev/null)
+          SSH_USER=$(get_ssh_user 2>/dev/null)
+          
+          if [ -z "$DROPLET_IP" ]; then
+            echo "Error: Could not find droplet IP in metadata"
+            echo "Please ensure you have created a droplet using the create-droplet workflow"
+            exit 1
+          fi
+          
+          # Mask all sensitive values
+          echo "::add-mask::$DROPLET_IP"
+          echo "::add-mask::$SSH_PORT"
+          echo "::add-mask::$SSH_USER"
+          
+          # Store in temporary files for reuse
+          echo "$DROPLET_IP" > /tmp/droplet_ip
+          echo "$SSH_PORT" > /tmp/ssh_port
+          echo "$SSH_USER" > /tmp/ssh_user
+          
+          echo "✓ Sensitive data processed and masked"
       
       - name: Validate domain name input
         run: |
@@ -44,68 +68,13 @@ jobs:
           
           echo "✓ Domain name is valid"
       
-      - name: Resolve droplet IP address
-        id: resolve-ip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          source /tmp/metadata-helpers.sh
-          
-          echo "Resolving droplet IP address..."
-          
-          DROPLET_IP="${{ inputs.droplet_ip }}"
-          
-          # If IP not provided, try to read from metadata
-          if [ -z "$DROPLET_IP" ]; then
-            echo "Droplet IP not provided, reading from metadata..." > /dev/null 2>&1
-            
-            DROPLET_IP=$(get_droplet_ip) > /dev/null 2>&1
-            
-            if [ -z "$DROPLET_IP" ]; then
-              echo "Error: Could not find droplet IP in metadata"
-              echo ""
-              echo "Please either:"
-              echo "  1. Provide the droplet_ip input parameter, or"
-              echo "  2. Ensure you have created a droplet using the create-droplet workflow"
-              exit 1
-            fi
-            
-            echo "Found droplet IP in metadata" > /dev/null 2>&1
-          else
-            echo "Using provided droplet IP" > /dev/null 2>&1
-          fi
-          
-          # Validate IP address format
-          if ! [[ "$DROPLET_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "Error: Invalid IP address format"
-            exit 1
-          fi
-          
-          echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
-          echo "✓ Droplet IP resolved successfully"
-      
-      - name: Load SSH port from metadata
-        id: ssh-config
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          source /tmp/metadata-helpers.sh
-          
-          echo "Loading SSH port configuration..." > /dev/null 2>&1
-          
-          # Extract SSH port from metadata with fallback to 53222
-          SSH_PORT=$(get_ssh_port) > /dev/null 2>&1
-          
-          echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
-          echo "✓ SSH port configured successfully"
-      
       - name: Check DNS resolution
         id: dns-check
         run: |
           echo "Checking DNS resolution for ${{ inputs.domain_name }}..."
           
           DOMAIN="${{ inputs.domain_name }}"
-          EXPECTED_IP="${{ steps.resolve-ip.outputs.ip }}"
+          EXPECTED_IP=$(cat /tmp/droplet_ip)
           
           # Resolve domain using dig
           RESOLVED_IP=$(dig +short "$DOMAIN" A | head -n 1)
@@ -116,23 +85,23 @@ jobs:
             echo "Domain $DOMAIN does not resolve to any IP address."
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📋 DNS Configuration Required"
+            echo " DNS Configuration Required"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
             echo "Please configure the following DNS records with your domain registrar:"
             echo ""
             echo "  Record Type: A"
             echo "  Name:        @"
-            echo "  Value:       $EXPECTED_IP"
+            echo "  Value:       [Your droplet IP address]"
             echo "  TTL:         3600 (or default)"
             echo ""
             echo "  Record Type: A"
             echo "  Name:        www"
-            echo "  Value:       $EXPECTED_IP"
+            echo "  Value:       [Your droplet IP address]"
             echo "  TTL:         3600 (or default)"
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⏱️  Next Steps"
+            echo " Next Steps"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
             echo "1. Add the DNS records shown above to your domain registrar"
@@ -143,37 +112,42 @@ jobs:
             exit 1
           fi
           
-          echo "Domain resolves to: $RESOLVED_IP"
-          echo "Expected IP:        $EXPECTED_IP"
+          echo "Domain resolves to configured IP address"
+          echo "Expected IP matches resolved IP"
           
           if [ "$RESOLVED_IP" != "$EXPECTED_IP" ]; then
+            # If RESOLVED_IP differs from EXPECTED_IP (DROPLET_IP), return an error.
+            # This covers the case when the DNS A record points directly to the DROPLET_IP.
+            # If the DNS A record points elsewhere (e.g., external load balancer), 
+            # SSL MUST be configured on that external system instead.
+
             echo ""
             echo "❌ DNS Mismatch Detected"
             echo ""
-            echo "Domain $DOMAIN resolves to $RESOLVED_IP"
-            echo "but should resolve to $EXPECTED_IP"
+            echo "Domain $DOMAIN resolves to a different IP address"
+            echo "than the configured droplet IP address"
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📋 DNS Configuration Update Required"
+            echo " DNS Configuration Update Required"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
             echo "Please update your DNS records to point to the correct IP:"
             echo ""
             echo "  Record Type: A"
             echo "  Name:        @"
-            echo "  Value:       $EXPECTED_IP  (currently: $RESOLVED_IP)"
+            echo "  Value:       [Your droplet IP address]  (currently: [Different IP])"
             echo "  TTL:         3600 (or default)"
             echo ""
             echo "  Record Type: A"
             echo "  Name:        www"
-            echo "  Value:       $EXPECTED_IP"
+            echo "  Value:       [Your droplet IP address]"
             echo "  TTL:         3600 (or default)"
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⏱️  Next Steps"
+            echo " Next Steps"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
-            echo "1. Update the DNS A record to point to $EXPECTED_IP"
+            echo "1. Update the DNS A record to point to your droplet IP address"
             echo "2. Wait for DNS propagation (typically 5-30 minutes)"
             echo "3. Verify DNS propagation using: dig +short $DOMAIN"
             echo "4. Re-run this workflow once DNS is updated"
@@ -183,54 +157,55 @@ jobs:
           
           echo "✓ DNS resolution is correct!"
           
-          # Also check www subdomain
-          WWW_RESOLVED_IP=$(dig +short "www.$DOMAIN" A | head -n 1)
+          # Check www subdomain only for root domains (not subdomains)
+          DOT_COUNT=$(echo "$DOMAIN" | tr -cd '.' | wc -c)
           
-          if [ -z "$WWW_RESOLVED_IP" ]; then
-            echo "⚠️  Warning: www.$DOMAIN does not resolve"
-            echo "   Consider adding a DNS A record for www.$DOMAIN -> $EXPECTED_IP"
-          elif [ "$WWW_RESOLVED_IP" != "$EXPECTED_IP" ]; then
-            echo "⚠️  Warning: www.$DOMAIN resolves to $WWW_RESOLVED_IP (expected: $EXPECTED_IP)"
-            echo "   Consider updating the DNS A record for www.$DOMAIN"
+          if [ "$DOT_COUNT" -eq 1 ]; then
+            # Root domain - check www variant
+            WWW_RESOLVED_IP=$(dig +short "www.$DOMAIN" A | head -n 1)
+            
+            if [ -z "$WWW_RESOLVED_IP" ]; then
+              echo "⚠️  Warning: www.$DOMAIN does not resolve"
+              echo "   Consider adding a DNS A record for www.$DOMAIN pointing to your droplet IP"
+            elif [ "$WWW_RESOLVED_IP" != "$EXPECTED_IP" ]; then
+              echo "⚠️  Warning: www.$DOMAIN resolves to a different IP than expected"
+              echo "   Consider updating the DNS A record for www.$DOMAIN"
+            else
+              echo "✓ www.$DOMAIN also resolves correctly"
+            fi
           else
-            echo "✓ www.$DOMAIN also resolves correctly"
+            # Subdomain - www check not applicable
+            echo "✓ Subdomain detected - www check skipped"
           fi
       
       - name: Setup SSH key for connection
         run: |
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts (suppress output to prevent IP/port exposure)
-          ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ steps.resolve-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
-      
-      - name: Determine admin username
-        id: admin-user
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          source /tmp/metadata-helpers.sh
-          
-          echo "Determining admin username from metadata..." > /dev/null 2>&1
-          
-          # Extract admin username from metadata with fallback to 'admin'
-          ADMIN_USER=$(get_ssh_user) > /dev/null 2>&1
-          
-          echo "username=$ADMIN_USER" >> $GITHUB_OUTPUT
-          echo "✓ Admin username configured successfully"
+          ssh-keyscan -p $SSH_PORT -H $DROPLET_IP >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Copy setup-ssl.sh script to droplet
         run: |
           echo "Copying setup-ssl.sh to droplet..."
-          ADMIN_USER="${{ steps.admin-user.outputs.username }}"
           
-          scp -P ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          SSH_USER=$(cat /tmp/ssh_user)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          
+          scp -P $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
             infra/scripts/setup-ssl.sh \
-            ${ADMIN_USER}@${{ steps.resolve-ip.outputs.ip }}:/tmp/setup-ssl.sh
+            ${SSH_USER}@${DROPLET_IP}:/tmp/setup-ssl.sh
           
           echo "✓ Script copied successfully"
       
@@ -241,7 +216,11 @@ jobs:
         run: |
           echo "Running SSL setup script on droplet..."
           echo ""
-          ADMIN_USER="${{ steps.admin-user.outputs.username }}"
+          
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          SSH_USER=$(cat /tmp/ssh_user)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
           
           # Extract application username from metadata
           source /tmp/metadata-helpers.sh
@@ -253,18 +232,18 @@ jobs:
             exit 1
           fi
           
-          echo "Found application username: $APP_USERNAME"
+          echo "Found application username in metadata"
           
           # Make script executable and run it with sudo
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          ssh -p $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${ADMIN_USER}@${{ steps.resolve-ip.outputs.ip }} \
+            ${SSH_USER}@${DROPLET_IP} \
             "chmod +x /tmp/setup-ssl.sh && \
              sudo /tmp/setup-ssl.sh \
                '${{ inputs.domain_name }}' \
-               '${{ steps.resolve-ip.outputs.ip }}' \
+               '$DROPLET_IP' \
                '$APP_USERNAME'"
           
           echo ""

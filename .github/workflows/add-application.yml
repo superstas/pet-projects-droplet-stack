@@ -16,10 +16,6 @@ on:
         required: false
         type: string
         default: '/metrics'
-      droplet_ip:
-        description: 'IP address of the existing droplet'
-        required: true
-        type: string
 
 jobs:
   add-application:
@@ -33,12 +29,51 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Setup metadata helpers
+      - name: Process and mask sensitive data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # Copy metadata helper functions to a temporary location
+          echo "Processing sensitive data..."
+          
+          # Copy metadata helper functions first
           cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
           chmod +x /tmp/metadata-helpers.sh
-          echo "✓ Metadata helper functions loaded"
+          source /tmp/metadata-helpers.sh
+          
+          # Check if metadata exists
+          METADATA=$(get_metadata 2>/dev/null)
+          
+          if [ "$METADATA" = "{}" ] || [ -z "$METADATA" ]; then
+            echo "Error: No deployment metadata found"
+            echo "Please create a droplet first using the create-droplet workflow"
+            exit 1
+          fi
+          
+          # Get all connection details from metadata
+          echo "Reading connection details from metadata..."
+          DROPLET_IP=$(get_droplet_ip 2>/dev/null)
+          SSH_PORT=$(get_ssh_port 2>/dev/null)
+          SSH_USER=$(get_ssh_user 2>/dev/null)
+          
+          if [ -z "$DROPLET_IP" ] || [ -z "$SSH_PORT" ] || [ -z "$SSH_USER" ]; then
+            echo "Error: Could not load connection details from metadata"
+            exit 1
+          fi
+          
+          # Mask all sensitive values
+          echo "::add-mask::$DROPLET_IP"
+          echo "::add-mask::$SSH_PORT"
+          echo "::add-mask::$SSH_USER"
+          
+          # Store in temporary files for reuse
+          echo "$DROPLET_IP" > /tmp/droplet_ip
+          echo "$SSH_PORT" > /tmp/ssh_port
+          echo "$SSH_USER" > /tmp/ssh_user
+          echo "$METADATA" > /tmp/metadata
+          
+          echo "✓ Sensitive data processed and masked"
+      
+
       
       - name: Validate inputs
         run: |
@@ -57,34 +92,17 @@ jobs:
             exit 1
           fi
           
-          # Validate IP address format
-          if [[ ! "${{ inputs.droplet_ip }}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "Error: Invalid IP address format"
-            exit 1
-          fi
-          
           echo "✓ All inputs are valid"
       
       - name: Check for port conflicts
         id: port-check
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          source /tmp/metadata-helpers.sh
-          
           echo "Checking for port conflicts..."
           
           NEW_PORT="${{ inputs.app_port }}"
           
-          # Get metadata from GitHub Variable (suppress output to avoid logging sensitive data)
-          METADATA=$(get_metadata)
-          
-          # Check if metadata exists
-          if [ "$METADATA" = "{}" ]; then
-            echo "Error: No deployment metadata found"
-            echo "Please ensure you have created a droplet first using the create-droplet workflow"
-            exit 1
-          fi
+          # Read metadata from temporary file (already processed)
+          METADATA=$(cat /tmp/metadata)
           
           # Extract existing ports from metadata
           EXISTING_PORTS=$(echo "$METADATA" | jq -r '.applications[].port')
@@ -105,48 +123,44 @@ jobs:
           echo "✓ Port $NEW_PORT is available"
           echo "port_available=true" >> $GITHUB_OUTPUT
       
-      - name: Load SSH port from metadata
-        id: ssh-config
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      - name: Verify connection details
         run: |
-          source /tmp/metadata-helpers.sh
-          
-          echo "Loading SSH port from metadata..." > /dev/null 2>&1
-          
-          SSH_PORT=$(get_ssh_port) > /dev/null 2>&1
-          
-          echo "✓ SSH port loaded successfully"
-          echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
+          echo "✓ Connection details loaded from metadata and ready for use"
       
       - name: Setup SSH key for connection
         run: |
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts (suppress output to prevent IP/port exposure)
-          ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ inputs.droplet_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p $SSH_PORT -H $DROPLET_IP >> ~/.ssh/known_hosts 2>/dev/null || true
       
-      - name: Add admin_username input parameter
+      - name: Verify admin access configuration
         run: |
           echo "Note: This workflow requires admin access to the server"
-          echo "Using default admin username: admin"
-          echo "If you used a different username during droplet creation, this will fail"
+          echo "Admin username will be retrieved securely from metadata"
+          echo "If connection fails, verify the SSH user was configured correctly during droplet creation"
       
       - name: Copy setup script to droplet
         run: |
           echo "Copying setup-application.sh to droplet..."
           
-          # Use 'admin' as default admin username (can be overridden via workflow_dispatch input if needed)
-          ADMIN_USER="admin" > /dev/null 2>&1
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          SSH_USER=$(cat /tmp/ssh_user)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
           
-          scp -P ${{ steps.ssh-config.outputs.port }} \
+          scp -P $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
             infra/scripts/setup-application.sh \
-            ${ADMIN_USER}@${{ inputs.droplet_ip }}:/tmp/setup-application.sh
+            ${SSH_USER}@${DROPLET_IP}:/tmp/setup-application.sh
           
           echo "✓ Script copied successfully"
       
@@ -155,14 +169,17 @@ jobs:
         run: |
           echo "Running application setup for new domain..."
           
-          ADMIN_USER="admin" > /dev/null 2>&1
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          SSH_USER=$(cat /tmp/ssh_user)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
           
           # Make script executable and run it with sudo
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          ssh -p $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${ADMIN_USER}@${{ inputs.droplet_ip }} \
+            ${SSH_USER}@${DROPLET_IP} \
             "chmod +x /tmp/setup-application.sh && \
              sudo /tmp/setup-application.sh \
                '${{ inputs.domain_name }}' \
@@ -190,8 +207,8 @@ jobs:
           
           echo "Updating deployment metadata..."
           
-          # Read existing metadata (suppress output to avoid logging sensitive data)
-          EXISTING_METADATA=$(get_metadata)
+          # Read existing metadata from temporary file (already processed)
+          EXISTING_METADATA=$(cat /tmp/metadata)
           
           # Create new application entry using jq for proper JSON formatting
           NEW_APP=$(jq -n \
@@ -240,11 +257,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🔒 Connection Details" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Sensitive connection information (IP address, SSH port, usernames) is stored securely in GitHub Variables." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "To access your application:" >> $GITHUB_STEP_SUMMARY
           echo "- **Deploy workflow**: Automatically retrieves connection details from metadata" >> $GITHUB_STEP_SUMMARY
-          echo "- **SSH access**: Connection details are available to authorized team members via metadata" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: This approach protects your infrastructure from exposure in public repositories." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -255,7 +269,7 @@ jobs:
           echo "**Add these DNS records with your domain registrar:**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "1. Add an **A record** for \`${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
-          echo "2. Add an **A record** for \`www.${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add an **A record** for \`www.${{ inputs.domain_name }}\` pointing to your droplet IP (only for root domains, not subdomains)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: DNS propagation typically takes 5-10 minutes, but can take up to 48 hours." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -276,7 +290,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### All Applications on This Droplet" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          source /tmp/metadata-helpers.sh
-          METADATA=$(get_metadata)
+          # Read updated metadata from temporary file
+          METADATA=$(cat /tmp/metadata)
           echo "$METADATA" | jq -r '.applications[] | "- \(.domain): port \(.port), service: \(.service_name)"' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

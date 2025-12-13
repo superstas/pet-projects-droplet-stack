@@ -127,18 +127,27 @@ validate_dns() {
     
     log_info "DNS validation successful!"
     
-    # Also check www subdomain
-    local www_resolved_ip
-    www_resolved_ip=$(dig +short "www.$domain" A | head -n 1)
+    # Check www subdomain only for root domains (not subdomains)
+    local dot_count
+    dot_count=$(echo "$domain" | tr -cd '.' | wc -c)
     
-    if [ -z "$www_resolved_ip" ]; then
-        log_warn "www.$domain does not resolve to any IP"
-        log_warn "Consider adding a DNS A record for www.$domain -> $expected_ip"
-    elif [ "$www_resolved_ip" != "$expected_ip" ]; then
-        log_warn "www.$domain resolves to $www_resolved_ip (expected: $expected_ip)"
-        log_warn "Consider updating the DNS A record for www.$domain"
+    if [ "$dot_count" -eq 1 ]; then
+        # Root domain - check www variant
+        local www_resolved_ip
+        www_resolved_ip=$(dig +short "www.$domain" A | head -n 1)
+        
+        if [ -z "$www_resolved_ip" ]; then
+            log_warn "www.$domain does not resolve to any IP"
+            log_warn "Consider adding a DNS A record for www.$domain -> $expected_ip"
+        elif [ "$www_resolved_ip" != "$expected_ip" ]; then
+            log_warn "www.$domain resolves to $www_resolved_ip (expected: $expected_ip)"
+            log_warn "Consider updating the DNS A record for www.$domain"
+        else
+            log_info "www.$domain also resolves correctly to $expected_ip"
+        fi
     else
-        log_info "www.$domain also resolves correctly to $expected_ip"
+        # Subdomain - www check not applicable
+        log_info "Subdomain detected - www check skipped"
     fi
     
     return 0

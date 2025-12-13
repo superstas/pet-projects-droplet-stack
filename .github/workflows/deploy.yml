@@ -33,12 +33,49 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.ref }}
       
-      - name: Setup metadata helpers
+      - name: Process and mask sensitive data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # Copy metadata helper functions to a temporary location
+          echo "Processing sensitive data..."
+          
+          # Copy metadata helper functions first
           cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
           chmod +x /tmp/metadata-helpers.sh
-          echo "✓ Metadata helper functions ready"
+          source /tmp/metadata-helpers.sh
+          
+          # Check if metadata exists
+          METADATA=$(get_metadata 2>/dev/null)
+          
+          if [ "$METADATA" = "{}" ] || [ -z "$METADATA" ]; then
+            echo "Error: No deployment metadata found"
+            echo "Please create a droplet first using the create-droplet workflow"
+            exit 1
+          fi
+          
+          # Get all connection details from metadata
+          echo "Reading connection details from metadata..."
+          DROPLET_IP=$(get_droplet_ip 2>/dev/null)
+          SSH_PORT=$(get_ssh_port 2>/dev/null)
+          SSH_USER=$(get_ssh_user 2>/dev/null)
+          
+          if [ -z "$DROPLET_IP" ] || [ -z "$SSH_PORT" ] || [ -z "$SSH_USER" ]; then
+            echo "Error: Could not load connection details from metadata"
+            exit 1
+          fi
+          
+          # Mask all sensitive values
+          echo "::add-mask::$DROPLET_IP"
+          echo "::add-mask::$SSH_PORT"
+          echo "::add-mask::$SSH_USER"
+          
+          # Store in temporary files for reuse
+          echo "$DROPLET_IP" > /tmp/droplet_ip
+          echo "$SSH_PORT" > /tmp/ssh_port
+          echo "$SSH_USER" > /tmp/ssh_user
+          echo "$METADATA" > /tmp/metadata
+          
+          echo "✓ Sensitive data processed and masked"
       
       - name: Extract tag name
         id: tag
@@ -54,20 +91,13 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Deploying version: $TAG"
       
-      - name: Load deployment metadata
+      - name: Load deployment metadata and connection details
         id: metadata
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          source /tmp/metadata-helpers.sh
+          echo "Loading deployment metadata..."
           
-          METADATA=$(get_metadata > /dev/null 2>&1 && get_metadata)
-          
-          if [ "$METADATA" = "{}" ]; then
-            echo "Error: No deployment metadata found"
-            echo "Please create a droplet first using the create-droplet workflow"
-            exit 1
-          fi
+          # Read metadata from temporary file (already processed)
+          METADATA=$(cat /tmp/metadata)
           
           # Determine which application to deploy
           if [ -n "${{ inputs.domain_name }}" ]; then
@@ -79,11 +109,11 @@ jobs:
           
           echo "Deploying application: $APP_DOMAIN"
           
-          # Extract application details
+          # Extract application details (non-sensitive)
           APP_USERNAME=$(echo "$METADATA" | jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .username")
           APP_SERVICE=$(echo "$METADATA" | jq -r ".applications[] | select(.domain == \"$APP_DOMAIN\") | .service_name")
-          DROPLET_IP=$(echo "$METADATA" | jq -r '.droplet.ip')
           
+          # Validate application exists
           if [ -z "$APP_USERNAME" ] || [ "$APP_USERNAME" = "null" ]; then
             echo "Error: Application $APP_DOMAIN not found in metadata"
             echo ""
@@ -92,43 +122,45 @@ jobs:
             exit 1
           fi
           
-          echo "username=$APP_USERNAME" >> $GITHUB_OUTPUT
+          # Store application username in temporary file for reuse
+          echo "$APP_USERNAME" > /tmp/app_username
+          
+          # Store non-sensitive data in outputs
           echo "service=$APP_SERVICE" >> $GITHUB_OUTPUT
-          echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
           echo "domain=$APP_DOMAIN" >> $GITHUB_OUTPUT
           
-          echo "✓ Loaded metadata successfully"
-      
-      - name: Load SSH port from metadata
-        id: ssh-config
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          source /tmp/metadata-helpers.sh
-          
-          SSH_PORT=$(get_ssh_port > /dev/null 2>&1 && get_ssh_port) > /dev/null 2>&1
-          echo "port=$SSH_PORT" >> $GITHUB_OUTPUT
-          echo "✓ SSH port configured successfully"
+          echo "✓ Loaded metadata and connection details successfully"
       
       - name: Setup SSH key for connection
         run: |
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts (suppress output to prevent IP/port exposure)
-          ssh-keyscan -p ${{ steps.ssh-config.outputs.port }} -H ${{ steps.metadata.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p "$SSH_PORT" -H "$DROPLET_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Create release directory on droplet
         run: |
           echo "Creating release directory for ${{ steps.tag.outputs.tag }}..."
           
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          APP_USERNAME=$(cat /tmp/app_username)
+          
+          # Connect as admin user but create directories in application user's home
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "mkdir -p ~/releases/${{ steps.tag.outputs.tag }}/app"
+            "$SSH_USER@$DROPLET_IP" \
+            "sudo mkdir -p /home/$APP_USERNAME/releases/${{ steps.tag.outputs.tag }}/app && sudo chown -R $APP_USERNAME:$APP_USERNAME /home/$APP_USERNAME/releases"
           
           echo "✓ Release directory created successfully"
       
@@ -143,26 +175,37 @@ jobs:
             exit 1
           fi
           
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          
           # Create tar archive locally
           tar -czf /tmp/app.tar.gz -C "$APP_DIR" .
           echo "✓ Created tar archive"
           
-          # Transfer archive via scp
-          scp -P ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          APP_USERNAME=$(cat /tmp/app_username)
+          
+          # Transfer archive via scp to admin user's tmp
+          scp -P "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
             /tmp/app.tar.gz \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }}:/tmp/app-${{ steps.metadata.outputs.username }}.tar.gz
+            "$SSH_USER@$DROPLET_IP:/tmp/app-$APP_USERNAME.tar.gz"
           echo "✓ Transferred archive to remote server"
           
           # Extract on remote server and cleanup remote archive
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "tar -xzf /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz -C ~/releases/${{ steps.tag.outputs.tag }}/app/ && rm /tmp/app-${{ steps.metadata.outputs.username }}.tar.gz"
+            "$SSH_USER@$DROPLET_IP" \
+            "sudo tar -xzf /tmp/app-$APP_USERNAME.tar.gz -C /home/$APP_USERNAME/releases/${{ steps.tag.outputs.tag }}/app/ && sudo chown -R $APP_USERNAME:$APP_USERNAME /home/$APP_USERNAME/releases/${{ steps.tag.outputs.tag }} && sudo rm /tmp/app-$APP_USERNAME.tar.gz"
           echo "✓ Extracted archive on remote server"
           
           # Cleanup local archive
@@ -175,12 +218,18 @@ jobs:
         run: |
           echo "Setting permissions..."
           
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          APP_USERNAME=$(cat /tmp/app_username)
+          
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "chmod +x ~/releases/${{ steps.tag.outputs.tag }}/app/start.sh"
+            "$SSH_USER@$DROPLET_IP" \
+            "sudo chmod +x /home/$APP_USERNAME/releases/${{ steps.tag.outputs.tag }}/app/start.sh"
           
           echo "✓ Permissions set"
       
@@ -188,12 +237,18 @@ jobs:
         run: |
           echo "Switching symlink to new release..."
           
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          APP_USERNAME=$(cat /tmp/app_username)
+          
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "ln -sfn ~/releases/${{ steps.tag.outputs.tag }}/app ~/app"
+            "$SSH_USER@$DROPLET_IP" \
+            "sudo ln -sfn /home/$APP_USERNAME/releases/${{ steps.tag.outputs.tag }}/app /home/$APP_USERNAME/app && sudo chown -h $APP_USERNAME:$APP_USERNAME /home/$APP_USERNAME/app"
           
           echo "✓ Symlink updated to point to ${{ steps.tag.outputs.tag }}"
       
@@ -201,11 +256,16 @@ jobs:
         run: |
           echo "Restarting application service..."
           
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "$SSH_USER@$DROPLET_IP" \
             "sudo systemctl restart ${{ steps.metadata.outputs.service }}"
           
           echo "✓ Service ${{ steps.metadata.outputs.service }} restarted"
@@ -217,11 +277,16 @@ jobs:
         run: |
           echo "Verifying service status..."
           
-          SERVICE_STATUS=$(ssh -p ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          
+          SERVICE_STATUS=$(ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+            "$SSH_USER@$DROPLET_IP" \
             "sudo systemctl is-active ${{ steps.metadata.outputs.service }}")
           
           if [ "$SERVICE_STATUS" != "active" ]; then
@@ -230,11 +295,11 @@ jobs:
             # Get service logs for debugging
             echo ""
             echo "Service logs:"
-            ssh -p ${{ steps.ssh-config.outputs.port }} \
+            ssh -p "$SSH_PORT" \
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o LogLevel=ERROR \
-              ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
+              "$SSH_USER@$DROPLET_IP" \
               "sudo journalctl -u ${{ steps.metadata.outputs.service }} -n 50 --no-pager"
             
             exit 1
@@ -276,24 +341,30 @@ jobs:
         run: |
           echo "Cleaning up old releases..."
           
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          # Read connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_USER=$(cat /tmp/ssh_user)
+          APP_USERNAME=$(cat /tmp/app_username)
+          
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            'cd ~/releases && ls -t | tail -n +4 | xargs -r rm -rf'
+            "$SSH_USER@$DROPLET_IP" \
+            "cd /home/$APP_USERNAME/releases && sudo ls -t | tail -n +4 | sudo xargs -r rm -rf"
           
           echo "✓ Kept last 3 releases, removed older ones"
           
           # List remaining releases
           echo ""
           echo "Remaining releases:"
-          ssh -p ${{ steps.ssh-config.outputs.port }} \
+          ssh -p "$SSH_PORT" \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${{ steps.metadata.outputs.username }}@${{ steps.metadata.outputs.ip }} \
-            "ls -1 ~/releases"
+            "$SSH_USER@$DROPLET_IP" \
+            "sudo ls -1 /home/$APP_USERNAME/releases"
       
       - name: Deployment summary
         if: always()
