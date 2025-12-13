@@ -115,14 +115,14 @@ teardown() {
     unset GITHUB_TOKEN
     run get_droplet_ip
     assert_failure
-    assert_output --partial "GITHUB_TOKEN"
+    assert_output --partial "Unable to retrieve deployment configuration"
 }
 
 @test "get_droplet_ip: requires GITHUB_REPOSITORY environment variable" {
     unset GITHUB_REPOSITORY
     run get_droplet_ip
     assert_failure
-    assert_output --partial "GITHUB_REPOSITORY"
+    assert_output --partial "Unable to retrieve deployment configuration"
 }
 
 # ============================================================================
@@ -139,14 +139,14 @@ teardown() {
     unset GITHUB_TOKEN
     run get_ssh_port
     assert_failure
-    assert_output --partial "GITHUB_TOKEN"
+    assert_output --partial "Unable to retrieve deployment configuration"
 }
 
 @test "get_ssh_port: requires GITHUB_REPOSITORY environment variable" {
     unset GITHUB_REPOSITORY
     run get_ssh_port
     assert_failure
-    assert_output --partial "GITHUB_REPOSITORY"
+    assert_output --partial "Unable to retrieve deployment configuration"
 }
 
 # ============================================================================
@@ -163,14 +163,14 @@ teardown() {
     unset GITHUB_TOKEN
     run get_ssh_user
     assert_failure
-    assert_output --partial "GITHUB_TOKEN"
+    assert_output --partial "Unable to retrieve deployment configuration"
 }
 
 @test "get_ssh_user: requires GITHUB_REPOSITORY environment variable" {
     unset GITHUB_REPOSITORY
     run get_ssh_user
     assert_failure
-    assert_output --partial "GITHUB_REPOSITORY"
+    assert_output --partial "Unable to retrieve deployment configuration"
 }
 
 # ============================================================================
@@ -323,13 +323,13 @@ teardown() {
 # Default Value Tests
 # ============================================================================
 
-@test "default values: get_ssh_port returns 53222 as default" {
-    run grep "53222" "$PROJECT_ROOT/infra/scripts/metadata-helpers.sh"
+@test "default values: get_ssh_port returns 22 as default" {
+    run grep '"22"' "$PROJECT_ROOT/infra/scripts/metadata-helpers.sh"
     assert_success
 }
 
-@test "default values: get_ssh_user returns admin as default" {
-    run grep '"admin"' "$PROJECT_ROOT/infra/scripts/metadata-helpers.sh"
+@test "default values: get_ssh_user returns root as default" {
+    run grep '"root"' "$PROJECT_ROOT/infra/scripts/metadata-helpers.sh"
     assert_success
 }
 

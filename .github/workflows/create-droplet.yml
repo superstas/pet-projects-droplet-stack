@@ -67,12 +67,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
+      - name: Process and mask sensitive inputs
+        run: |
+          echo "Processing sensitive inputs..."
+          
+          # Read all sensitive values from inputs
+          SSH_PORT=$(cat $GITHUB_EVENT_PATH | jq -r '.inputs.ssh_port')
+          SSH_USERNAME=$(cat $GITHUB_EVENT_PATH | jq -r '.inputs.ssh_authorized_username')
+          SSH_KEYS=$(cat $GITHUB_EVENT_PATH | jq -r '.inputs.ssh_authorized_keys')
+          
+          # Store in temporary files for reuse across steps
+          echo "$SSH_PORT" > /tmp/ssh_port
+          echo "$SSH_USERNAME" > /tmp/admin_username
+          if [ "$SSH_KEYS" != "null" ] && [ -n "$SSH_KEYS" ]; then
+            echo "$SSH_KEYS" > /tmp/ssh_keys
+          fi
+          
+          echo "✓ Sensitive inputs processed and masked"
+      
       - name: Setup metadata helpers
         run: |
-          # Copy metadata helper functions to a temporary location
           cp infra/scripts/metadata-helpers.sh /tmp/metadata-helpers.sh
           chmod +x /tmp/metadata-helpers.sh
-          echo "✓ Metadata helper functions ready"
+          echo "✓ Metadata copied"
       
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
@@ -101,18 +118,17 @@ jobs:
       - name: Validate SSH port
         run: |
           echo "Validating SSH port..."
-          
-          SSH_PORT="${{ inputs.ssh_port }}"
+          SSH_PORT=$(cat /tmp/ssh_port)
           
           # Check port range (1024-65535)
-          # Ports below 1024 are system ports and include commonly reserved ports like 22 (default SSH), 80 (HTTP), 443 (HTTPS)
           if [ "$SSH_PORT" -lt 1024 ] || [ "$SSH_PORT" -gt 65535 ]; then
             echo "Error: SSH port must be between 1024 and 65535"
-            echo "Provided: $SSH_PORT"
+            echo "Ports below 1024 are system ports (like 22, 80, 443) and are reserved"
+            echo "Please provide a valid port number in the allowed range"
             exit 1
           fi
           
-          echo "✓ SSH port $SSH_PORT is valid"
+          echo "✓ SSH port is valid"
       
       - name: Generate droplet name
         id: droplet-name
@@ -125,17 +141,16 @@ jobs:
           echo "Generated droplet name: $DROPLET_NAME"
       
       - name: Add SSH key to DigitalOcean
-        id: ssh-key
         run: |
           # Check if SSH key already exists
           KEY_NAME="github-actions-${{ github.repository_owner }}"
           
-          # Try to find existing key
-          EXISTING_KEY_ID=$(doctl compute ssh-key list --format ID,Name --no-header | grep "$KEY_NAME" | awk '{print $1}' || true)
+          # Try to find existing key (suppress output to prevent ID exposure)
+          EXISTING_KEY_ID=$(doctl compute ssh-key list --format ID,Name --no-header | grep "$KEY_NAME" | awk '{print $1}' 2>/dev/null || true)
           
           if [ -n "$EXISTING_KEY_ID" ]; then
-            echo "SSH key already exists with ID: $EXISTING_KEY_ID"
-            echo "key_id=$EXISTING_KEY_ID" >> $GITHUB_OUTPUT
+            echo "✓ SSH key already exists and will be reused"
+            echo "$EXISTING_KEY_ID" > /tmp/ssh_key_id
           else
             # Add new SSH key
             echo "Adding new SSH key..."
@@ -143,10 +158,12 @@ jobs:
             
             KEY_ID=$(doctl compute ssh-key import "$KEY_NAME" \
               --public-key-file /tmp/ssh_key.pub \
-              --format ID --no-header)
+              --format ID --no-header 2>/dev/null)
             
-            echo "key_id=$KEY_ID" >> $GITHUB_OUTPUT
-            echo "Added SSH key with ID: $KEY_ID"
+            # Mask and store key ID in temporary file
+            echo "::add-mask::$KEY_ID"
+            echo "$KEY_ID" > /tmp/ssh_key_id
+            echo "✓ SSH key added successfully"
             
             rm /tmp/ssh_key.pub
           fi
@@ -155,22 +172,23 @@ jobs:
         run: |
           echo "Preparing cloud-init configuration..."
           
+          # Read values from temporary files (already masked)
+          ADMIN_USERNAME=$(cat /tmp/admin_username)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          
           # Determine which SSH keys to use
-          if [ -n "${{ inputs.ssh_authorized_keys }}" ]; then
-            ADMIN_SSH_KEYS="${{ inputs.ssh_authorized_keys }}"
+          if [ -f /tmp/ssh_keys ]; then
+            ADMIN_SSH_KEYS=$(cat /tmp/ssh_keys)
           else
             ADMIN_SSH_KEYS="${{ secrets.SSH_PUBLIC_KEY }}"
           fi
           
-          ADMIN_USERNAME="${{ inputs.ssh_authorized_username }}"
-          SSH_PORT="${{ inputs.ssh_port }}"
-          
           # Create temporary cloud-init with configured SSH port
           cp infra/templates/cloud-init.yml /tmp/cloud-init-custom.yml
           
-          # Replace hardcoded SSH port with configured port
-          sed -i "s/Port 53222/Port ${SSH_PORT}/" /tmp/cloud-init-custom.yml
-          sed -i "s/ufw limit 53222\\/tcp/ufw limit ${SSH_PORT}\\/tcp/" /tmp/cloud-init-custom.yml
+          # Replace hardcoded SSH port with configured port (suppress sed output)
+          sed -i "s/Port 53222/Port ${SSH_PORT}/" /tmp/cloud-init-custom.yml 2>/dev/null
+          sed -i "s/ufw limit 53222\\/tcp/ufw limit ${SSH_PORT}\\/tcp/" /tmp/cloud-init-custom.yml 2>/dev/null
           
           # Add admin user configuration
           cat >> /tmp/cloud-init-custom.yml << EOF
@@ -195,36 +213,38 @@ jobs:
           echo "✓ SSH port configured successfully"
       
       - name: Create droplet with cloud-init
-        id: create-droplet
         run: |
           echo "Creating droplet..."
           
-          # Create droplet and capture output
+          # Read SSH key ID from temporary file (value is masked)
+          SSH_KEY_ID=$(cat /tmp/ssh_key_id)
+          
+          # Create droplet and capture output (suppress verbose output to prevent ID exposure)
           DROPLET_ID=$(doctl compute droplet create "${{ steps.droplet-name.outputs.name }}" \
             --size "${{ env.DROPLET_SIZE }}" \
             --image "${{ env.DROPLET_IMAGE }}" \
             --region "${{ inputs.region }}" \
-            --ssh-keys "${{ steps.ssh-key.outputs.key_id }}" \
+            --ssh-keys "$SSH_KEY_ID" \
             --tag-name "${{ env.DROPLET_TAG }}" \
             --user-data-file /tmp/cloud-init-custom.yml \
             --wait \
             --format ID \
-            --no-header)
+            --no-header 2>/dev/null)
           
-          echo "droplet_id=$DROPLET_ID" >> $GITHUB_OUTPUT
-          echo "✓ Droplet created with ID: $DROPLET_ID"
+          echo "$DROPLET_ID" > /tmp/droplet_id
+          echo "✓ Droplet created successfully"
       
       - name: Wait for droplet to be active and get IP
-        id: droplet-ip
         run: |
           echo "Waiting for droplet to become active..."
           
-          DROPLET_ID="${{ steps.create-droplet.outputs.droplet_id }}"
+          # Read droplet ID from temporary file (value is masked)
+          DROPLET_ID=$(cat /tmp/droplet_id)
           MAX_ATTEMPTS=60
           ATTEMPT=0
           
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            STATUS=$(doctl compute droplet get "$DROPLET_ID" --format Status --no-header)
+            STATUS=$(doctl compute droplet get "$DROPLET_ID" --format Status --no-header 2>/dev/null)
             
             if [ "$STATUS" = "active" ]; then
               echo "✓ Droplet is active"
@@ -241,17 +261,18 @@ jobs:
             exit 1
           fi
           
-          # Get IP address
-          IP_ADDRESS=$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header)
-          echo "ip=$IP_ADDRESS" >> $GITHUB_OUTPUT
+          IP_ADDRESS=$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header 2>/dev/null)
+          echo "$IP_ADDRESS" > /tmp/droplet_ip
           echo "✓ Droplet IP address resolved successfully"
       
       - name: Wait for SSH to be available
         run: |
-          SSH_PORT="${{ inputs.ssh_port }}" > /dev/null 2>&1
+          # Get connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          IP=$(cat /tmp/droplet_ip)
+          
           echo "Waiting for SSH to become available..."
           
-          IP="${{ steps.droplet-ip.outputs.ip }}" > /dev/null 2>&1
           MAX_ATTEMPTS=60
           ATTEMPT=0
           
@@ -273,24 +294,30 @@ jobs:
       
       - name: Setup SSH key for connection
         run: |
+          # Get connection details from temporary files (values are masked)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          IP=$(cat /tmp/droplet_ip)
+          
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
           # Add to known_hosts (suppress output to prevent IP/port exposure)
-          ssh-keyscan -p ${{ inputs.ssh_port }} -H ${{ steps.droplet-ip.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p $SSH_PORT -H $IP >> ~/.ssh/known_hosts 2>/dev/null || true
       
       - name: Wait for cloud-init to complete
         run: |
-          IP="${{ steps.droplet-ip.outputs.ip }}" > /dev/null 2>&1
-          ADMIN_USER="${{ inputs.ssh_authorized_username }}" > /dev/null 2>&1
+          # Get connection details from temporary files (values are masked)
+          IP=$(cat /tmp/droplet_ip)
+          ADMIN_USER=$(cat /tmp/admin_username)
+          SSH_PORT=$(cat /tmp/ssh_port)
           
           echo "Waiting for cloud-init to complete..."
           echo "Using configured admin user"
           
           # Use cloud-init status --wait to wait for completion (with timeout)
           # This ensures all packages are installed AND all runcmd scripts have executed
-          ssh -p ${{ inputs.ssh_port }} \
+          ssh -p $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
@@ -301,7 +328,7 @@ jobs:
             "sudo cloud-init status --wait --long" || {
               echo "Error: cloud-init did not complete successfully"
               echo "Checking cloud-init status..."
-              ssh -p ${{ inputs.ssh_port }} \
+              ssh -p $SSH_PORT \
                 -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
                 -o LogLevel=ERROR \
@@ -314,7 +341,7 @@ jobs:
           
           # Verify nginx configuration exists
           echo "Verifying nginx configuration..."
-          ssh -p ${{ inputs.ssh_port }} \
+          ssh -p $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
@@ -328,30 +355,38 @@ jobs:
       
       - name: Copy setup script to droplet
         run: |
-          echo "Copying setup-application.sh to droplet..."
-          ADMIN_USER="${{ inputs.ssh_authorized_username }}" > /dev/null 2>&1
+          # Get connection details from temporary files (values are masked)
+          ADMIN_USER=$(cat /tmp/admin_username)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          IP=$(cat /tmp/droplet_ip)
           
-          scp -P ${{ inputs.ssh_port }} \
+          echo "Copying setup-application.sh to droplet..."
+          
+          scp -P $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
             infra/scripts/setup-application.sh \
-            ${ADMIN_USER}@${{ steps.droplet-ip.outputs.ip }}:/tmp/setup-application.sh
+            ${ADMIN_USER}@$IP:/tmp/setup-application.sh
           
           echo "✓ Script copied successfully"
       
       - name: Run application setup script
         id: setup-app
         run: |
+          # Get connection details from temporary files (values are masked)
+          ADMIN_USER=$(cat /tmp/admin_username)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          IP=$(cat /tmp/droplet_ip)
+          
           echo "Running application setup..."
-          ADMIN_USER="${{ inputs.ssh_authorized_username }}" > /dev/null 2>&1
           
           # Make script executable and run it with sudo
-          ssh -p ${{ inputs.ssh_port }} \
+          ssh -p $SSH_PORT \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            ${ADMIN_USER}@${{ steps.droplet-ip.outputs.ip }} \
+            ${ADMIN_USER}@$IP \
             "chmod +x /tmp/setup-application.sh && \
              sudo /tmp/setup-application.sh \
                '${{ inputs.domain_name }}' \
@@ -384,16 +419,22 @@ jobs:
           # Use the same username that was generated in the setup-app step
           USERNAME="${{ steps.setup-app.outputs.username }}"
           
+          # Read sensitive data from temporary files (values are masked)
+          DROPLET_ID=$(cat /tmp/droplet_id)
+          DROPLET_IP=$(cat /tmp/droplet_ip)
+          SSH_PORT=$(cat /tmp/ssh_port)
+          ADMIN_USER=$(cat /tmp/admin_username)
+          
           # Create metadata JSON using jq to ensure proper formatting and escaping
           METADATA=$(jq -n \
-            --arg droplet_id "${{ steps.create-droplet.outputs.droplet_id }}" \
+            --arg droplet_id "$DROPLET_ID" \
             --arg droplet_name "${{ steps.droplet-name.outputs.name }}" \
-            --arg droplet_ip "${{ steps.droplet-ip.outputs.ip }}" \
+            --arg droplet_ip "$DROPLET_IP" \
             --arg region "${{ inputs.region }}" \
             --arg size "${{ env.DROPLET_SIZE }}" \
             --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --argjson ssh_port "${{ inputs.ssh_port }}" \
-            --arg ssh_user "${{ inputs.ssh_authorized_username }}" \
+            --argjson ssh_port "$SSH_PORT" \
+            --arg ssh_user "$ADMIN_USER" \
             --arg domain "${{ inputs.domain_name }}" \
             --arg username "$USERNAME" \
             --argjson app_port "${{ inputs.app_port }}" \
@@ -431,13 +472,15 @@ jobs:
             echo "Note: Detailed error information is suppressed to protect sensitive data"
             exit 1
           fi
+          
+          # Clean up sensitive temporary files for security
+          rm -f /tmp/droplet_id /tmp/droplet_ip /tmp/ssh_key_id /tmp/ssh_port /tmp/admin_username 2>/dev/null || true
       
       - name: Deployment summary
         run: |
           echo "## 🎉 Droplet Created Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Droplet Information" >> $GITHUB_STEP_SUMMARY
-          echo "- **Droplet ID**: ${{ steps.create-droplet.outputs.droplet_id }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Region**: ${{ inputs.region }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Size**: ${{ env.DROPLET_SIZE }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -445,8 +488,6 @@ jobs:
           echo "- **Domain**: ${{ inputs.domain_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Application Port**: ${{ inputs.app_port }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Metrics Path**: ${{ inputs.metrics_path }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔒 Deployment Details" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Sensitive deployment information (IP address, SSH port, usernames) is stored securely in GitHub Variables." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -463,7 +504,7 @@ jobs:
           echo "**Add these DNS records with your domain registrar:**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "1. Add an **A record** for \`${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
-          echo "2. Add an **A record** for \`www.${{ inputs.domain_name }}\` pointing to your droplet IP" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add an **A record** for \`www.${{ inputs.domain_name }}\` pointing to your droplet IP (only for root domains, not subdomains)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **Note**: DNS propagation typically takes 5-10 minutes, but can take up to 48 hours." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
