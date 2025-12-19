@@ -275,6 +275,12 @@ server {
         add_header Cache-Control "public, immutable";
     }
     
+    # Block public access to metrics endpoint.
+    location $METRICS_PATH {
+        deny all;
+        return 404;
+    }
+    
     # Proxy to application
     location / {
         proxy_pass http://localhost:$APP_PORT;
@@ -320,6 +326,12 @@ server {
         alias $USER_HOME/app/static;
         expires 30d;
         add_header Cache-Control "public, immutable";
+    }
+    
+    # Block public access to metrics endpoint
+    location $METRICS_PATH {
+        deny all;
+        return 404;
     }
     
     # Proxy to application
